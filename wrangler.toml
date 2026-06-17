@@ -23,12 +23,12 @@ binding = "DB"
 database_name = "server-monitor-db"
 
 # Durable Objects：实时指标广播中心
-# 注意：首次部署前需要执行 `wrangler durable-object create MetricsBroadcaster --class MetricsBroadcaster`
-# 或者在部署后，wrangler 会自动创建对应的 DO namespace。
+# MetricsBroadcaster 类定义在本 worker 的 src/index.js 中并已导出，
+# 因此这里不要写 script_name（script_name 仅用于引用「其它」worker 里定义的 DO 类）。
+# wrangler deploy 会根据下面的声明自动创建/复用 DO namespace。
 [[durable_objects.bindings]]
 name = "METRICS_BROADCASTER"
 class_name = "MetricsBroadcaster"
-script_name = "cf-server-monitor"
 
 [[migrations]]
 tag = "v1"
