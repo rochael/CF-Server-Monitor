@@ -1,6 +1,6 @@
 import { checkAuth, simpleAuthResponse } from '../middleware/auth.js';
-import { getLatestMetrics, getLatestMetricsForAllServers, getAllServers } from '../database/schema.js';
-import { getServerDetail } from '../utils/cache.js';
+import { getLatestMetrics, getLatestMetricsForAllServers } from '../database/schema.js';
+import { getAllServers, getServerDetail } from '../utils/cache.js';
 import { mergeMetricsIntoServer } from '../utils/metrics.js';
 import { createSuccessResponse, createBadRequestResponse, createNotFoundResponse } from '../utils/errors.js';
 
@@ -21,6 +21,9 @@ export async function handleServerAPI(request, env, sys) {
   
   const latestMetrics = await getLatestMetrics(env.DB, id);
   mergeMetricsIntoServer(server, latestMetrics);
+  server.sysConfig = {
+    show_long_history: sys.show_long_history === 'true'
+  };
   
   return createSuccessResponse(server);
 }
@@ -61,7 +64,6 @@ export async function handleServersAPI(request, env, sys) {
     globalNetTx += parseFloat(server.net_tx || 0);
     
     let cCode = (server.country || '').toUpperCase();
-    if (cCode === 'TW') cCode = 'CN';
     if (cCode !== '') {
       countryStats[cCode] = (countryStats[cCode] || 0) + 1;
     }
@@ -81,7 +83,6 @@ export async function handleServersAPI(request, env, sys) {
       globalNetRx
     },
     countryStats,
-    latestMetricsMap: Object.fromEntries(latestMetricsMap),
     sysConfig: {
       show_price: sys.show_price === 'true',
       show_expire: sys.show_expire === 'true',

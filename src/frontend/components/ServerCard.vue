@@ -86,7 +86,7 @@
 
 <script setup>
 import { computed } from 'vue'
-import { formatBytes } from '../utils/api'
+import { formatBytes, getFlagCountryCode } from '../utils/api'
 import { t, currentLang } from '../utils/i18n'
 import { translations } from '../utils/i18n'
 import { TIME, PING } from '../utils/constants'
@@ -111,7 +111,7 @@ const trans = computed(() => translations[currentLang.value] || translations.en)
 
 const now = Date.now()
 
-const countryCode = computed(() => (props.server.country || 'xx').toLowerCase())
+const countryCode = computed(() => getFlagCountryCode(props.server.country))
 
 const isOnline = computed(() => {
   const lastUpdated = new Date(props.server.last_updated).getTime()
@@ -123,7 +123,12 @@ const statusText = computed(() => isOnline.value ? trans.value.online : trans.va
 
 const cpuPercent = computed(() => parseFloat(props.server.cpu || 0).toFixed(1))
 const ramPercent = computed(() => parseFloat(props.server.ram || 0).toFixed(1))
-const diskPercent = computed(() => parseFloat(props.server.disk || 0).toFixed(1))
+const diskPercent = computed(() => {
+  if (props.server.disk_total > 0) {
+    return ((props.server.disk_used / props.server.disk_total) * 100).toFixed(2)
+  }
+  return '0.00'
+})
 
 const trafficUsagePercent = computed(() => {
   const limit = parseFloat(props.server.traffic_limit) || 0

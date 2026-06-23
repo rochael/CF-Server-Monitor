@@ -25,7 +25,7 @@
         <div class="host-name">
           <span class="prompt">root@</span>
           <span v-if="server.country && server.country !== 'xx'">
-            <img :src="'https://flagcdn.com/24x18/' + server.country.toLowerCase() + '.png'" :alt="server.country" class="flag-img" style="margin-right:6px;">
+            <img :src="'https://flagcdn.com/24x18/' + getFlagCountryCode(server.country) + '.png'" :alt="server.country" class="flag-img" style="margin-right:6px;">
           </span>
           <span v-else>🏳️</span>
           <span>{{ server.name || 'Loading...' }}</span>
@@ -52,6 +52,10 @@
         <div class="sysinfo-item">
           <span class="sysinfo-label">🔧 {{ trans.cpuInfo }}</span>
           <span class="sysinfo-value sysinfo-small">{{ server.cpu_info || 'N/A' }} x {{ server.cpu_cores || 'N/A' }}</span>
+        </div>
+        <div class="sysinfo-item" v-if="hasGpuData">
+          <span class="sysinfo-label">🎮 {{ trans.gpuInfo || 'GPU Info' }}</span>
+          <span class="sysinfo-value sysinfo-small">{{ server.gpu_info }}</span>
         </div>
         <div class="sysinfo-item">
           <span class="sysinfo-label">💾 {{ trans.totalDiskRam }}</span>
@@ -129,7 +133,7 @@
             <span class="chart-title-icon">▸</span>
             {{ trans.memoryUsage }}
           </span>
-          <div>
+          <div class="chart-current-value-container">
             <span class="chart-current-value">{{ ramPercent }}%</span>
             <div class="chart-subtitle">{{ trans.swap }}: {{ server.swap_used || '0' }} / {{ server.swap_total || '0' }} MiB</div>
           </div>
@@ -145,13 +149,26 @@
             <span class="chart-title-icon">▸</span>
             {{ trans.diskUsage }}
           </span>
-          <div>
+          <div class="chart-current-value-container">
             <span class="chart-current-value">{{ diskPercent }}%</span>
             <div class="chart-subtitle">{{ trans.used }} {{ formatBytes(server.disk_used*1024*1024) }} / {{ formatBytes(server.disk_total*1024*1024) }}</div>
           </div>
         </div>
         <div class="chart-body">
           <canvas ref="diskChartRef"></canvas>
+        </div>
+      </div>
+
+      <div class="chart-card" v-show="hasGpuData">
+        <div class="chart-card-header">
+          <span class="chart-title">
+            <span class="chart-title-icon">▸</span>
+            {{ trans.gpuUsage || 'GPU Usage' }}
+          </span>
+          <span class="chart-current-value">{{ gpuPercent }}%</span>
+        </div>
+        <div class="chart-body">
+          <canvas ref="gpuChartRef"></canvas>
         </div>
       </div>
 
@@ -207,14 +224,32 @@
             {{ trans.latencyMonitor }}
           </span>
           <div class="ping-indicator">
-            <span class="ping-ct">{{ trans.pingCt }} <b>{{ server.ping_ct || '0' }}ms</b></span>
-            <span class="ping-cu">{{ trans.pingCu }} <b>{{ server.ping_cu || '0' }}ms</b></span>
-            <span class="ping-cm">{{ trans.pingCm }} <b>{{ server.ping_cm || '0' }}ms</b></span>
-            <span class="ping-bd">{{ trans.pingBd }} <b>{{ server.ping_bd || '0' }}ms</b></span>
+            <span class="ping-ct">{{ trans.pingCt }} <b>{{ formatPing(server.ping_ct) }}</b></span>
+            <span class="ping-cu">{{ trans.pingCu }} <b>{{ formatPing(server.ping_cu) }}</b></span>
+            <span class="ping-cm">{{ trans.pingCm }} <b>{{ formatPing(server.ping_cm) }}</b></span>
+            <span class="ping-bd">{{ trans.pingBd }} <b>{{ formatPing(server.ping_bd) }}</b></span>
           </div>
         </div>
         <div class="chart-body">
           <canvas ref="pingChartRef"></canvas>
+        </div>
+      </div>
+
+      <div class="chart-card" v-show="hasLossData">
+        <div class="chart-card-header">
+          <span class="chart-title">
+            <span class="chart-title-icon">▸</span>
+            {{ trans.packetLoss || 'Packet Loss' }}
+          </span>
+          <div class="ping-indicator">
+            <span v-if="isLossValid(server.loss_ct)" class="ping-ct">{{ trans.pingCt }} <b>{{ formatLoss(server.loss_ct) }}</b></span>
+            <span v-if="isLossValid(server.loss_cu)" class="ping-cu">{{ trans.pingCu }} <b>{{ formatLoss(server.loss_cu) }}</b></span>
+            <span v-if="isLossValid(server.loss_cm)" class="ping-cm">{{ trans.pingCm }} <b>{{ formatLoss(server.loss_cm) }}</b></span>
+            <span v-if="isLossValid(server.loss_bd)" class="ping-bd">{{ trans.pingBd }} <b>{{ formatLoss(server.loss_bd) }}</b></span>
+          </div>
+        </div>
+        <div class="chart-body">
+          <canvas ref="lossChartRef"></canvas>
         </div>
       </div>
     </div>
@@ -244,7 +279,7 @@ import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import TerminalHeader from '../components/TerminalHeader.vue'
 import Footer from '../components/Footer.vue'
-import { fetchServerDetail, fetchAllHistory, formatBytes, fetchConfig, isAdminLoggedIn, createLiveSocket } from '../utils/api.js'
+import { fetchServerDetail, fetchAllHistory, formatBytes, isAdminLoggedIn, createLiveSocket, getFlagCountryCode } from '../utils/api.js'
 import Chart from 'chart.js/auto'
 import 'chartjs-adapter-date-fns'
 import { currentLang, translations } from '../utils/i18n'
@@ -265,14 +300,14 @@ if (!serverId) {
 
 const server = ref({})
 const currentHours = ref(0.167)
-const lastUpdateText = ref('just now')
+const lastUpdateText = ref('')
 const config = ref(null)
 const showLoginModal = ref(false)
 
 const trans = computed(() => translations[currentLang.value] || translations.en)
 
 const timeOptions = computed(() => {
-  return [
+  const options = [
     { hours: 0.167, label: '10m' },
     { hours: 0.5, label: '30m' },
     { hours: 1, label: '1h' },
@@ -280,6 +315,16 @@ const timeOptions = computed(() => {
     { hours: 12, label: '12h' },
     { hours: 24, label: '24h' },
   ]
+
+  if (config.value?.show_long_history) {
+    options.push(
+      { hours: 48, label: '2d' },
+      { hours: 96, label: '4d' },
+      { hours: 168, label: '7d' },
+    )
+  }
+
+  return options
 })
 
 const isOnline = computed(() => {
@@ -288,13 +333,15 @@ const isOnline = computed(() => {
 })
 
 const cpuPercent = computed(() => (parseFloat(server.value.cpu) || 0).toFixed(1))
+const gpuPercent = computed(() => (parseFloat(server.value.gpu) || 0).toFixed(1))
 const ramPercent = computed(() => (parseFloat(server.value.ram) || 0).toFixed(1))
-const diskPercent = computed(() => (parseFloat(server.value.disk) || 0).toFixed(1))
-
-const lastReportTime = computed(() => {
-  const lastUpdated = new Date(server.value.last_updated).getTime()
-  return new Date(lastUpdated).toLocaleString(undefined, { hour12: false })
+const diskPercent = computed(() => {
+  if (server.value.disk_total > 0) {
+    return ((server.value.disk_used / server.value.disk_total) * 100).toFixed(2)
+  }
+  return '0.00'
 })
+const hasGpuData = computed(() => server.value.gpu !== null && server.value.gpu !== undefined && server.value.gpu !== '' && !!server.value.gpu_info)
 
 const isExpired = computed(() => {
   if (!server.value.expire_date) return false
@@ -312,28 +359,34 @@ const expireDaysText = computed(() => {
 })
 
 const cpuChartRef = ref(null)
+const gpuChartRef = ref(null)
 const ramChartRef = ref(null)
 const diskChartRef = ref(null)
 const netChartRef = ref(null)
 const procChartRef = ref(null)
 const connChartRef = ref(null)
 const pingChartRef = ref(null)
+const lossChartRef = ref(null)
 const loadChartRef = ref(null)
 const historyLoaded = ref(false)
 
 const charts = {}
 const chartsReady = ref(false)
+const hasLossHistoryData = ref(false)
 let isInitializingCharts = false
+let databaseUpgradeAlertShown = false
 
 const safeDestroyCharts = () => {
   try {
     if (charts.cpu) { charts.cpu.destroy(); charts.cpu = null }
+    if (charts.gpu) { charts.gpu.destroy(); charts.gpu = null }
     if (charts.ram) { charts.ram.destroy(); charts.ram = null }
     if (charts.disk) { charts.disk.destroy(); charts.disk = null }
     if (charts.net) { charts.net.destroy(); charts.net = null }
     if (charts.proc) { charts.proc.destroy(); charts.proc = null }
     if (charts.conn) { charts.conn.destroy(); charts.conn = null }
     if (charts.ping) { charts.ping.destroy(); charts.ping = null }
+    if (charts.loss) { charts.loss.destroy(); charts.loss = null }
     if (charts.load) { charts.load.destroy(); charts.load = null }
   } catch (e) { /* ignore */ }
 }
@@ -346,6 +399,11 @@ const parseLoadAvg = (loadAvgStr) => {
   const load15 = parseFloat(parts[2]) || 0
   return [load1, load5, load15]
 }
+
+const isLossValid = (value) => value !== null && value !== undefined && value !== '' && !Number.isNaN(parseFloat(value))
+const formatLoss = (value) => isLossValid(value) ? `${Math.max(0, Math.min(100, parseFloat(value))).toFixed(0)}%` : ''
+const hasLossData = computed(() => hasLossHistoryData.value || ['loss_ct', 'loss_cu', 'loss_cm', 'loss_bd'].some(key => isLossValid(server.value[key])))
+const formatPing = (value) => (value === null || value === undefined || value === '' || value === 'null') ? 'Timeout' : `${value}ms`
 
 const parseBootTimeToMs = (bootTime) => {
   if (!bootTime) return null
@@ -480,8 +538,8 @@ const initCharts = () => {
           tooltipFormat: 'yyyy-MM-dd HH:mm:ss'
         },
         title: {
-          display: true,
-          text: 'Time',
+          display: false,
+          text: '',
           color: axisLabelColor,
           font: { size: 10, family: "'JetBrains Mono', monospace" }
         },
@@ -525,6 +583,14 @@ const initCharts = () => {
     })
   }
 
+  if (gpuChartRef.value) {
+    charts.gpu = new Chart(gpuChartRef.value.getContext('2d'), {
+      type: 'line',
+      data: { datasets: [{ label: 'GPU', data: [], borderColor: '#ff7b72', backgroundColor: 'rgba(255, 123, 114, 0.05)', fill: true, borderWidth: 1.5, spanGaps: false }] },
+      options: createChartOptions('%')
+    })
+  }
+
   if (ramChartRef.value) {
     charts.ram = new Chart(ramChartRef.value.getContext('2d'), {
       type: 'line',
@@ -550,7 +616,7 @@ const initCharts = () => {
     charts.proc = new Chart(procChartRef.value.getContext('2d'), {
       type: 'line',
       data: { datasets: [{ label: 'Processes', data: [], borderColor: '#f778ba', backgroundColor: 'rgba(247, 120, 186, 0.03)', fill: true, borderWidth: 1.5, spanGaps: false }] },
-      options: createChartOptions('', false, 'Count')
+      options: createChartOptions('')
     })
   }
 
@@ -576,7 +642,7 @@ const initCharts = () => {
           { label: 'UDP', data: [], borderColor: '#f778ba', backgroundColor: 'transparent', tension: 0.4, borderWidth: 1.5, pointRadius: 0, hoverRadius: 5, spanGaps: false }
         ]
       },
-      options: createChartOptions('', true, 'Connections')
+      options: createChartOptions('', true)
     })
   }
 
@@ -591,7 +657,22 @@ const initCharts = () => {
           { label: 'BD', data: [], borderColor: '#b392f0', backgroundColor: 'transparent', tension: 0.3, borderWidth: 1.5, pointRadius: 0, hoverRadius: 5, spanGaps: false }
         ]
       },
-      options: createChartOptions(' ms', true, 'Latency')
+      options: createChartOptions(' ms', true)
+    })
+  }
+
+  if (lossChartRef.value) {
+    charts.loss = new Chart(lossChartRef.value.getContext('2d'), {
+      type: 'line',
+      data: {
+        datasets: [
+          { label: 'CT', data: [], borderColor: '#00d4aa', backgroundColor: 'transparent', tension: 0.3, borderWidth: 1.5, pointRadius: 0, hoverRadius: 5, spanGaps: false },
+          { label: 'CU', data: [], borderColor: '#ffb870', backgroundColor: 'transparent', tension: 0.3, borderWidth: 1.5, pointRadius: 0, hoverRadius: 5, spanGaps: false },
+          { label: 'CM', data: [], borderColor: '#4da6ff', backgroundColor: 'transparent', tension: 0.3, borderWidth: 1.5, pointRadius: 0, hoverRadius: 5, spanGaps: false },
+          { label: 'BD', data: [], borderColor: '#b392f0', backgroundColor: 'transparent', tension: 0.3, borderWidth: 1.5, pointRadius: 0, hoverRadius: 5, spanGaps: false }
+        ]
+      },
+      options: createChartOptions('%', true)
     })
   }
 
@@ -605,7 +686,7 @@ const initCharts = () => {
           { label: trans.value.load15m || '15 Min', data: [], borderColor: '#4da6ff', backgroundColor: 'transparent', tension: 0.3, borderWidth: 1.5, pointRadius: 0, hoverRadius: 5 }
         ]
       },
-      options: createChartOptions('', true, 'Load')
+      options: createChartOptions('', true)
     })
   }
 }
@@ -647,6 +728,8 @@ const getMaxGapMs = () => {
 }
 
 const applyGapBreak = (data) => {
+  // 超过1小时的数据不使用断点，图表直接连续连接
+  if (currentHours.value > 1) return data
   if (!data || data.length < 2) return data
   
   const maxGapMs = getMaxGapMs()
@@ -670,7 +753,7 @@ const sampleData = (dataPoints) => {
   return dataPoints.filter((_, i) => i % step === 0)
 }
 
-const updateChartDataset = (chart, datasetIndex, dataPoints, xField = 'timestamp', yField) => {
+const updateChartDataset = (chart, datasetIndex, dataPoints, xField = 'timestamp', yField, allowZero = false) => {
   if (!chart) return
 
   const dataset = chart.data.datasets[datasetIndex]
@@ -687,7 +770,7 @@ const updateChartDataset = (chart, datasetIndex, dataPoints, xField = 'timestamp
       const val = parseFloat(d[yField])
       return {
         x: new Date(d[xField]).getTime(),
-        y: (val > 0) ? val : null
+        y: Number.isNaN(val) ? null : (allowZero ? val : ((val > 0) ? val : null))
       }
     })
 
@@ -709,7 +792,7 @@ const updateChartDatasetWithSwap = (chart, datasetIndex, dataPoints) => {
 
   const dataset = chart.data.datasets[datasetIndex]
   if (!dataset) return
-  
+
   const endTime = Date.now()
   const startTime = endTime - currentHours.value * 60 * 60 * 1000
 
@@ -721,6 +804,39 @@ const updateChartDatasetWithSwap = (chart, datasetIndex, dataPoints) => {
       const swapTotal = parseFloat(d.swap_total) || 0
       const swapUsed = parseFloat(d.swap_used) || 0
       const percent = swapTotal === 0 ? 0 : (swapUsed / swapTotal) * 100
+      return { x: new Date(d.timestamp).getTime(), y: percent }
+    })
+
+    processedData.sort((a, b) => a.x - b.x)
+    processedData = applyGapBreak(processedData)
+  }
+
+  if (chart.options && chart.options.scales && chart.options.scales.x) {
+    chart.options.scales.x.min = startTime
+    chart.options.scales.x.max = endTime
+  }
+
+  dataset.data = processedData
+  chart.update('none')
+}
+
+const updateChartDatasetWithDisk = (chart, datasetIndex, dataPoints) => {
+  if (!chart) return
+
+  const dataset = chart.data.datasets[datasetIndex]
+  if (!dataset) return
+
+  const endTime = Date.now()
+  const startTime = endTime - currentHours.value * 60 * 60 * 1000
+
+  let processedData = []
+  if (dataPoints && dataPoints.length > 0) {
+    const sampledData = sampleData(dataPoints)
+
+    processedData = sampledData.map(d => {
+      const diskTotal = parseFloat(d.disk_total) || 0
+      const diskUsed = parseFloat(d.disk_used) || 0
+      const percent = diskTotal === 0 ? 0 : (diskUsed / diskTotal) * 100
       return { x: new Date(d.timestamp).getTime(), y: percent }
     })
 
@@ -781,11 +897,13 @@ const loadAllHistory = async (hours) => {
     const res = await fetchAllHistory(serverId, hours)
     if (!res) return
     const allData = res
+    hasLossHistoryData.value = allData.some(item => ['loss_ct', 'loss_cu', 'loss_cm', 'loss_bd'].some(key => isLossValid(item[key])))
 
     updateChartDataset(charts.cpu, 0, allData, 'timestamp', 'cpu')
+    updateChartDataset(charts.gpu, 0, allData, 'timestamp', 'gpu', true)
     updateChartDataset(charts.ram, 0, allData, 'timestamp', 'ram')
     updateChartDatasetWithSwap(charts.ram, 1, allData)
-    updateChartDataset(charts.disk, 0, allData, 'timestamp', 'disk')
+    updateChartDatasetWithDisk(charts.disk, 0, allData)
     updateChartDataset(charts.proc, 0, allData, 'timestamp', 'processes')
     updateChartDataset(charts.net, 0, allData, 'timestamp', 'net_in_speed')
     updateChartDataset(charts.net, 1, allData, 'timestamp', 'net_out_speed')
@@ -795,6 +913,10 @@ const loadAllHistory = async (hours) => {
     updateChartDataset(charts.ping, 1, allData, 'timestamp', 'ping_cu')
     updateChartDataset(charts.ping, 2, allData, 'timestamp', 'ping_cm')
     updateChartDataset(charts.ping, 3, allData, 'timestamp', 'ping_bd')
+    updateChartDataset(charts.loss, 0, allData, 'timestamp', 'loss_ct', true)
+    updateChartDataset(charts.loss, 1, allData, 'timestamp', 'loss_cu', true)
+    updateChartDataset(charts.loss, 2, allData, 'timestamp', 'loss_cm', true)
+    updateChartDataset(charts.loss, 3, allData, 'timestamp', 'loss_bd', true)
     updateLoadChart(charts.load, allData)
 
     updateAllChartTimeUnits(hours)
@@ -809,6 +931,13 @@ const loadAllHistory = async (hours) => {
       })
     })
   } catch (e) {
+    if (e && e.code === 'DATABASE_UPGRADE_REQUIRED') {
+      if (!databaseUpgradeAlertShown) {
+        databaseUpgradeAlertShown = true
+        alert(trans.value.databaseUpgradeRequired || e.message || 'Database schema is not upgraded. Please upgrade database in Admin Panel.')
+      }
+      return
+    }
     console.error('[ERROR] Load history failed:', e)
   }
 }
@@ -833,7 +962,7 @@ const updateAllChartTimeUnits = (hours) => {
   })
 }
 
-const appendDataToChart = (chart, datasetIndex, timestamp, value, isPing = false) => {
+const appendDataToChart = (chart, datasetIndex, timestamp, value, isPing = false, emptyAsNull = false) => {
   if (!chart) return
   
   const dataset = chart.data.datasets[datasetIndex]
@@ -847,6 +976,8 @@ const appendDataToChart = (chart, datasetIndex, timestamp, value, isPing = false
   if (isPing) {
     const val = parseFloat(value)
     yVal = (val > 0) ? val : null
+  } else if (emptyAsNull && !isLossValid(value)) {
+    yVal = null
   } else {
     yVal = parseFloat(value) || 0
   }
@@ -867,7 +998,7 @@ const appendDataToChart = (chart, datasetIndex, timestamp, value, isPing = false
   chart.update('none')
 }
 
-const STATIC_FIELDS = ['id', 'name', 'country', 'arch', 'os', 'cpu_info', 'cpu_cores', 'ram_total', 'disk_total', 'expire_date', 'server_group', 'traffic_limit', 'net_rx_monthly', 'net_tx_monthly']
+const STATIC_FIELDS = ['id', 'name', 'country', 'arch', 'os', 'cpu_info', 'cpu_cores', 'gpu_info', 'ram_total', 'disk_total', 'expire_date', 'server_group', 'traffic_limit', 'net_rx_monthly', 'net_tx_monthly']
 
 const fetchCurrentStatus = async (incomingData) => {
   try {
@@ -888,15 +1019,18 @@ const fetchCurrentStatus = async (incomingData) => {
       }
       server.value = newServer
     } else {
+      config.value = data.sysConfig || null
       server.value = data
     }
 
     const dataTimestamp = new Date(data.last_updated).getTime()
     appendDataToChart(charts.cpu, 0, dataTimestamp, data.cpu)
+    appendDataToChart(charts.gpu, 0, dataTimestamp, data.gpu)
     appendDataToChart(charts.ram, 0, dataTimestamp, data.ram)
     const swapPercent = (parseFloat(data.swap_total) > 0) ? (parseFloat(data.swap_used) / parseFloat(data.swap_total)) * 100 : 0
     appendDataToChart(charts.ram, 1, dataTimestamp, swapPercent)
-    appendDataToChart(charts.disk, 0, dataTimestamp, data.disk)
+    const diskPercent = (parseFloat(data.disk_total) > 0) ? (parseFloat(data.disk_used) / parseFloat(data.disk_total)) * 100 : 0
+    appendDataToChart(charts.disk, 0, dataTimestamp, diskPercent)
     appendDataToChart(charts.proc, 0, dataTimestamp, data.processes)
     appendDataToChart(charts.net, 0, dataTimestamp, data.net_in_speed)
     appendDataToChart(charts.net, 1, dataTimestamp, data.net_out_speed)
@@ -906,6 +1040,10 @@ const fetchCurrentStatus = async (incomingData) => {
     appendDataToChart(charts.ping, 1, dataTimestamp, data.ping_cu, true)
     appendDataToChart(charts.ping, 2, dataTimestamp, data.ping_cm, true)
     appendDataToChart(charts.ping, 3, dataTimestamp, data.ping_bd, true)
+    appendDataToChart(charts.loss, 0, dataTimestamp, data.loss_ct, false, true)
+    appendDataToChart(charts.loss, 1, dataTimestamp, data.loss_cu, false, true)
+    appendDataToChart(charts.loss, 2, dataTimestamp, data.loss_cm, false, true)
+    appendDataToChart(charts.loss, 3, dataTimestamp, data.loss_bd, false, true)
     if (charts.load) {
       const loads = parseLoadAvg(data.load_avg)
       const time = new Date(dataTimestamp).getTime()
@@ -963,8 +1101,8 @@ const initChartsOnMount = async () => {
 
   await nextTick()
   
-  const allRefsReady = cpuChartRef.value && ramChartRef.value && diskChartRef.value &&
-    netChartRef.value && procChartRef.value && connChartRef.value && pingChartRef.value && loadChartRef.value
+  const allRefsReady = cpuChartRef.value && gpuChartRef.value && ramChartRef.value && diskChartRef.value &&
+    netChartRef.value && procChartRef.value && connChartRef.value && pingChartRef.value && lossChartRef.value && loadChartRef.value
   
   if (allRefsReady) {
     try {
@@ -1003,7 +1141,7 @@ const init = async () => {
   })
 }
 
-watch([cpuChartRef, ramChartRef, diskChartRef, netChartRef, procChartRef, connChartRef, pingChartRef, loadChartRef], () => {
+watch([cpuChartRef, gpuChartRef, ramChartRef, diskChartRef, netChartRef, procChartRef, connChartRef, pingChartRef, lossChartRef, loadChartRef], () => {
   if (!chartsReady.value) {
     initChartsOnMount()
   }

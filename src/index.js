@@ -1,22 +1,21 @@
-import { initDatabase, cleanupOldData, getMetricsHistory, rebuildDatabase } from './database/schema.js';
-import { checkOfflineNodes } from './services/notification.js';
+import { initDatabase, monthlyCleanup, dropMetricsHistoryOld, getMetricsHistory, rebuildDatabase } from './database/schema.js';
+import { checkOfflineNodes, checkExpiringServers } from './services/notification.js';
 import { updateDatabase } from './database/updateDatabase.js';
 import { handleAdminAPI } from './handlers/admin.js';
 import { serveFrontend } from './handlers/frontend.js';
 import { handleUpdate, handleWebSocketUpgrade } from './handlers/update.js';
 import { handleServerAPI, handleServersAPI } from './handlers/dashboard.js';
-import { loadSettings, loadSiteSettings } from './utils/settings.js';
+import { loadSettings, loadSiteSettings, setDebug } from './utils/settings.js';
 import { checkAuth, simpleAuthResponse } from './middleware/auth.js';
-import { getServerDetail, getMetricsHistoryCache, setMetricsHistoryCache } from './utils/cache.js';
-import { createSuccessResponse, createUnauthorizedResponse, createBadRequestResponse } from './utils/errors.js';
-
+import { getServerDetail, getMetricsHistoryCache, setMetricsHistoryCache, getCacheDuration } from './utils/cache.js';
+import { AppError, createSuccessResponse, createUnauthorizedResponse, createBadRequestResponse, createNotFoundResponse, createErrorResponse } from './utils/errors.js';
+import { verifyTurnstileToken } from './utils/common.js';
 // Durable Objects: 实时指标广播
 // 显式 import + extends，确保 wrangler 静态分析器能在入口文件直接识别此 DO 类
 import { MetricsBroadcaster as _MetricsBroadcaster }
   from './durable/MetricsBroadcaster.js';
 
 export class MetricsBroadcaster extends _MetricsBroadcaster {}
-
 
 async function getEncryptionKey(env) {
   const secret = env.TURNSTILE_SECRET_KEY || env.API_SECRET || 'default_secret_key_for_turnstile_encryption';
@@ -66,29 +65,15 @@ async function decryptCookieData(encoded, env) {
   }
 }
 
-async function verifyTurnstileToken(token, secretKey) {
-  if (!token || !secretKey) {
-    return false;
-  }
+async function isTurnstileCookieValid(request, env) {
+  const cookies = request.headers.get('Cookie') || '';
+  const turnstileCookie = cookies.split(';').find(c => c.trim().startsWith('turnstile_verified='));
   
-  try {
-    const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        secret: secretKey,
-        response: token
-      })
-    });
-    
-    const data = await response.json();
-    return data.success === true;
-  } catch (e) {
-    console.error('Turnstile verification error:', e);
-    return false;
-  }
+  if (!turnstileCookie) return false;
+  
+  const encryptedData = turnstileCookie.split('=')[1];
+  const decrypted = await decryptCookieData(encryptedData, env);
+  return decrypted && decrypted.expires && Date.now() < decrypted.expires * 1000;
 }
 
 async function fetchHistoryData(env, request, id, hours, columns, sys = null) {
@@ -108,16 +93,33 @@ async function fetchHistoryData(env, request, id, hours, columns, sys = null) {
   }
   
   const server = await getServerDetail(env.DB, id, isLoggedIn);
-  if (!server) return new Response('Not Found', { status: 404 });
+  if (!server) return createNotFoundResponse();
   
-  const clampedHours = Math.min(hours, 72);
-  
+  // 最多查询7天数据
+  const clampedHours = Math.min(hours, 168);
+  const cacheDuration = getCacheDuration(clampedHours);
+
   const cached = getMetricsHistoryCache(id, clampedHours, columns);
-  if (cached && Date.now() - cached.timestamp < 60000) {
+  if (cached && Date.now() - cached.timestamp < cacheDuration) {
     return createSuccessResponse(cached.data, { 'X-Cache': 'HIT' });
   }
   
-  const data = await getMetricsHistory(env.DB, id, clampedHours, columns);
+  let data;
+  try {
+    data = await getMetricsHistory(env.DB, id, clampedHours, columns);
+  } catch (e) {
+    const message = e && e.message ? e.message : String(e);
+    if (/no such column/i.test(message)) {
+      console.warn('[History] 数据库字段缺失，可能尚未升级数据库:', message);
+      return new Response(JSON.stringify({
+        code: 'DATABASE_UPGRADE_REQUIRED'
+      }), {
+        status: 409,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    throw e;
+  }
   
   setMetricsHistoryCache(id, clampedHours, columns, data);
   
@@ -126,6 +128,8 @@ async function fetchHistoryData(env, request, id, hours, columns, sys = null) {
 
 export default {
   async fetch(request, env, ctx) {
+    setDebug(env.DEBUG);
+
     const url = new URL(request.url);
     const method = request.method;
     const path = url.pathname;
@@ -145,12 +149,8 @@ export default {
     }
 
     const bypassTurnstilePaths = [
-      '/update',
       '/admin/api',
       '/api/config',
-      '/favicon.ico',
-      '/logo.svg',
-      '/install.sh'
     ];
 
     const isApiRequest = path.startsWith('/api/') || path.startsWith('/admin/api');
@@ -167,27 +167,14 @@ export default {
       const turnstileSecretKey = sys.turnstile_secret_key || '';
       
       if (turnstileEnabled) {
-        const cookies = request.headers.get('Cookie') || '';
-        const turnstileCookie = cookies.split(';').find(c => c.trim().startsWith('turnstile_verified='));
-        
-        let hasValidCookie = false;
-        if (turnstileCookie) {
-          const encryptedData = turnstileCookie.split('=')[1];
-          const decrypted = await decryptCookieData(encryptedData, env);
-          if (decrypted && decrypted.expires && Date.now() < decrypted.expires * 1000) {
-            hasValidCookie = true;
-          }
-        }
+        const hasValidCookie = await isTurnstileCookieValid(request, env);
         
         if (!hasValidCookie) {
           const turnstileToken = request.headers.get('X-Turnstile-Token');
           const isVerified = await verifyTurnstileToken(turnstileToken, turnstileSecretKey);
           
           if (!isVerified) {
-            return new Response(JSON.stringify({ error: 'Turnstile verification failed', code: 403 }), {
-              status: 403,
-              headers: { 'Content-Type': 'application/json' }
-            });
+            return createErrorResponse(new AppError('Turnstile verification failed', 403));
           }
           
           setTurnstileCookie = true;
@@ -195,17 +182,8 @@ export default {
       }
     }
 
-    async function ensureSiteSettings() {
-      if (!sys) {
-        sys = await loadSiteSettings(env.DB);
-      }
-      return sys;
-    }
-
     async function ensureFullSettings() {
-      if (!sys || !sys.site_title) {
-        sys = await loadSettings(env.DB);
-      }
+      sys = await loadSettings(env.DB);
       return sys;
     }
 
@@ -224,31 +202,23 @@ export default {
         }
       }},
       { method: 'GET', path: '/api/config', handler: async () => {
-        await ensureSiteSettings();
+        await ensureFullSettings();
         const turnstileEnabled = sys.turnstile_enabled === 'true';
         let cookieAuth = false;
         
         if (turnstileEnabled) {
-          const cookies = request.headers.get('Cookie') || '';
-          const turnstileCookie = cookies.split(';').find(c => c.trim().startsWith('turnstile_verified='));
-          
-          if (turnstileCookie) {
-            const encryptedData = turnstileCookie.split('=')[1];
-            const decrypted = await decryptCookieData(encryptedData, env);
-            if (decrypted && decrypted.expires && Date.now() < decrypted.expires * 1000) {
-              cookieAuth = true;
-            }
-          }
+          cookieAuth = await isTurnstileCookieValid(request, env);
         }
         
         return createSuccessResponse({
           turnstile_enabled: turnstileEnabled,
           turnstile_site_key: sys.turnstile_site_key || '',
-          cookie_auth: cookieAuth
+          cookie_auth: cookieAuth,
+          show_long_history: sys.show_long_history === 'true'
         });
       }},
       { method: 'GET', path: '/api/server', handler: async () => {
-        await ensureSiteSettings();
+        await ensureFullSettings();
         return handleServerAPI(request, env, sys);
       }},
       { method: 'GET', path: '/api/servers', handler: async () => {
@@ -258,26 +228,26 @@ export default {
       { method: 'GET', path: '/api/ws', handler: async () => handleWebSocketUpgrade(request, env) },
 
       { method: 'GET', path: '/api/history/all', handler: async () => {
-        await ensureSiteSettings();
+        await ensureFullSettings();
         const id = url.searchParams.get('id');
         const hours = parseFloat(url.searchParams.get('hours') || '24');
-        const allColumns = 'cpu, ram, disk, processes, net_in_speed, net_out_speed, tcp_conn, udp_conn, ping_ct, ping_cu, ping_cm, ping_bd, swap_total, swap_used, load_avg';
+        const allColumns = 'cpu, gpu, gpu_info, ram, disk_total, disk_used, processes, net_in_speed, net_out_speed, tcp_conn, udp_conn, ping_ct, ping_cu, ping_cm, ping_bd, loss_ct, loss_cu, loss_cm, loss_bd, swap_total, swap_used, load_avg';
         return fetchHistoryData(env, request, id, hours, allColumns, sys);
       }},
       { method: 'POST', path: '/admin/api', handler: async () => {
         await ensureFullSettings();
         return handleAdminAPI(request, env, sys);
       }},
-      { method: 'GET', path: '/updateDatabase', handler: async () => {
-        await ensureSiteSettings();
+      { method: 'POST', path: '/updateDatabase', handler: async () => {
+        await ensureFullSettings();
         if (!await checkAuth(request, env, sys)) {
           return simpleAuthResponse();
         }
         const result = await updateDatabase(env.DB);
         return createSuccessResponse(result);
       }},
-      { method: 'GET', path: '/rebuild', handler: async () => {
-        await ensureSiteSettings();
+      { method: 'POST', path: '/rebuild', handler: async () => {
+        await ensureFullSettings();
         if (!await checkAuth(request, env, sys)) {
           return simpleAuthResponse();
         }
@@ -315,16 +285,48 @@ export default {
 
   async scheduled(event, env, ctx) {
     const cron = event.cron;
-    console.log(`[Cron] 定时任务触发: ${cron}`);
+    console.debug(`[Cron] 定时任务触发: ${cron}`);
     
-    if (cron === '50 23 * * *') {
-      console.log('[Cron] 开始执行每日数据清理任务');
-      await cleanupOldData(env.DB);
-      console.log('[Cron] 每日数据清理任务完成');
-    } else if (cron === '*/1 * * * *') {
-      console.log('[Cron] 开始执行离线节点检测');
+    if (cron === '*/1 * * * *') {
+      console.debug('[Cron] 开始执行离线节点检测');
       await checkOfflineNodes(env.DB);
-      console.log('[Cron] 离线节点检测完成');
+      console.debug('[Cron] 离线节点检测完成');
+    } else if (cron === '0 * * * *') {
+      const now = new Date();
+      const day = now.getUTCDate();
+      const hour = now.getUTCHours();
+      
+      if (day === 1 && hour === 0) {
+        console.debug('[Cron] 开始执行每月数据清理任务（表轮换）');
+        await monthlyCleanup(env.DB);
+        console.debug('[Cron] 每月数据清理任务完成');
+      }
+      
+      if (day === 8 && hour === 0) {
+        console.debug('[Cron] 开始执行每月8号清理旧表任务');
+        await dropMetricsHistoryOld(env.DB);
+        console.debug('[Cron] 每月8号清理旧表任务完成');
+      }
+      
+      if (hour === 12) {
+        console.debug('[Cron] 开始执行服务器到期检测');
+        await checkExpiringServers(env.DB);
+        console.debug('[Cron] 服务器到期检测完成');
+      }
+    }else if(env.DEBUG == 1){
+      if (cron === '* * 1 * *') {
+        console.debug('[Cron DEBUG] 开始执行每月数据清理任务（表轮换）');
+        await monthlyCleanup(env.DB);
+        console.debug('[Cron DEBUG] 每月数据清理任务完成');
+      } else if (cron === '* * 8 * *') {
+        console.debug('[Cron DEBUG] 开始执行每月8号清理旧表任务');
+        await dropMetricsHistoryOld(env.DB);
+        console.debug('[Cron DEBUG] 每月8号清理旧表任务完成');
+      } else if (cron === '0 12 * * *') {
+        console.debug('[Cron DEBUG] 开始执行服务器到期检测');
+        await checkExpiringServers(env.DB);
+        console.debug('[Cron DEBUG] 服务器到期检测完成');
+      }
     }
   }
 };

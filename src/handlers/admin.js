@@ -1,42 +1,11 @@
 import { checkAuth, simpleAuthResponse, validateCredentials, generateToken } from '../middleware/auth.js';
-import { clearNotificationSettingsCache } from '../services/notification.js';
-import { getLatestMetricsForAllServers, getAllServers } from '../database/schema.js';
+import { getLatestMetricsForAllServers } from '../database/schema.js';
+import { getAllServers } from '../utils/cache.js';
 import { clearServersListCache, clearServerDetailCache } from '../utils/cache.js';
+import { clearSiteSettingsCache } from '../utils/settings.js';
 import { mergeMetricsIntoServer } from '../utils/metrics.js';
-
-async function md5Hash(input) {
-  const encoder = new TextEncoder();
-  const data = encoder.encode(input);
-  const hash = await crypto.subtle.digest('MD5', data);
-  return Array.from(new Uint8Array(hash))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-}
-
-async function verifyTurnstileToken(token, secretKey) {
-  if (!token || !secretKey) {
-    return false;
-  }
-  
-  try {
-    const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        secret: secretKey,
-        response: token
-      })
-    });
-    
-    const data = await response.json();
-    return data.success === true;
-  } catch (e) {
-    console.error('Turnstile verification error:', e);
-    return false;
-  }
-}
+import { verifyTurnstileToken, md5Hash } from '../utils/common.js';
+import { AppError, createSuccessResponse, createBadRequestResponse, createUnauthorizedResponse, createErrorResponse } from '../utils/errors.js';
 
 function isValidUUID(id) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
@@ -44,6 +13,132 @@ function isValidUUID(id) {
 
 function isValidName(name) {
   return name && typeof name === 'string' && name.trim().length > 0 && name.length <= 100;
+}
+
+const D1_DAILY_READ_LIMIT = 5000000;
+const D1_DAILY_WRITE_LIMIT = 100000;
+const WORKERS_DAILY_REQUEST_LIMIT = 100000;
+
+function getUtcTodayRange() {
+  const now = new Date();
+  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const end = new Date(start.getTime() + 86400000 - 1);
+  return {
+    date: start.toISOString().slice(0, 10),
+    start: start.toISOString().slice(0, 10),
+    end: end.toISOString().slice(0, 10),
+    startTime: start.toISOString(),
+    endTime: end.toISOString()
+  };
+}
+
+function getLast24HoursRange() {
+  const now = new Date();
+  const end = now;
+  const start = new Date(now.getTime() - 86400000);
+  return {
+    date: start.toISOString().slice(0, 10) + ' ~ ' + end.toISOString().slice(0, 10),
+    startTime: start.toISOString(),
+    endTime: end.toISOString()
+  };
+}
+
+async function cloudflareGraphql(query, variables, token) {
+  const response = await fetch('https://api.cloudflare.com/client/v4/graphql', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ query, variables })
+  });
+  const data = await response.json();
+  if (!response.ok || data.errors) {
+    const message = data.errors && data.errors.length > 0 ? data.errors.map(e => e.message).join('; ') : 'Cloudflare GraphQL request failed';
+    throw new Error(message);
+  }
+  return data.data;
+}
+
+async function fetchCloudflareUsage(token, accountId, range) {
+  const query = `query CloudflareUsage($accountTag: string!, $start: Date, $end: Date, $startTime: string, $endTime: string) {
+    viewer {
+      accounts(filter: { accountTag: $accountTag }) {
+        d1AnalyticsAdaptiveGroups(
+          limit: 10000
+          filter: { date_geq: $start, date_leq: $end }
+        ) {
+          sum { rowsRead rowsWritten }
+          dimensions { databaseId }
+        }
+        workersInvocationsAdaptive(
+          limit: 10000
+          filter: { datetime_geq: $startTime, datetime_leq: $endTime }
+        ) {
+          sum { requests }
+        }
+      }
+    }
+  }`;
+  const data = await cloudflareGraphql(query, {
+    accountTag: accountId,
+    start: range.start || range.startTime.slice(0, 10),
+    end: range.end || range.endTime.slice(0, 10),
+    startTime: range.startTime,
+    endTime: range.endTime
+  }, token);
+  const account = data.viewer?.accounts?.[0] || {};
+  const groups = account.d1AnalyticsAdaptiveGroups || [];
+  const usage = groups.reduce((total, group) => {
+    total.rowsRead += Number(group.sum?.rowsRead || 0);
+    total.rowsWritten += Number(group.sum?.rowsWritten || 0);
+    return total;
+  }, { rowsRead: 0, rowsWritten: 0 });
+  const workersRequests = (account.workersInvocationsAdaptive || []).reduce((total, group) => {
+    return total + Number(group.sum?.requests || 0);
+  }, 0);
+  return { rowsRead: usage.rowsRead, rowsWritten: usage.rowsWritten, workersRequests, databaseCount: groups.length };
+}
+
+async function getD1DailyUsage(token, accountId) {
+  if (!token) throw new Error('请先配置 Cloudflare Token');
+  if (!accountId) throw new Error('请先配置 Cloudflare 用户 ID / Account ID');
+
+  const todayRange = getUtcTodayRange();
+  const last24Range = getLast24HoursRange();
+
+  const [todayUsage, last24Usage] = await Promise.all([
+    fetchCloudflareUsage(token, accountId, todayRange),
+    fetchCloudflareUsage(token, accountId, last24Range)
+  ]);
+
+  return {
+    today: {
+      date: todayRange.date,
+      rowsRead: todayUsage.rowsRead,
+      rowsWritten: todayUsage.rowsWritten,
+      readLimit: D1_DAILY_READ_LIMIT,
+      writeLimit: D1_DAILY_WRITE_LIMIT,
+      readRemaining: Math.max(D1_DAILY_READ_LIMIT - todayUsage.rowsRead, 0),
+      writeRemaining: Math.max(D1_DAILY_WRITE_LIMIT - todayUsage.rowsWritten, 0),
+      workersRequests: todayUsage.workersRequests,
+      workersRequestLimit: WORKERS_DAILY_REQUEST_LIMIT,
+      workersRequestRemaining: Math.max(WORKERS_DAILY_REQUEST_LIMIT - todayUsage.workersRequests, 0),
+      databaseCount: todayUsage.databaseCount,
+      accountId
+    },
+    last24Hours: {
+      date: last24Range.date,
+      rowsRead: last24Usage.rowsRead,
+      rowsWritten: last24Usage.rowsWritten,
+      readLimit: D1_DAILY_READ_LIMIT,
+      writeLimit: D1_DAILY_WRITE_LIMIT,
+      workersRequests: last24Usage.workersRequests,
+      workersRequestLimit: WORKERS_DAILY_REQUEST_LIMIT,
+      databaseCount: last24Usage.databaseCount,
+      accountId
+    }
+  };
 }
 
 export async function handleAdminAPI(request, env, sys) {
@@ -54,10 +149,7 @@ export async function handleAdminAPI(request, env, sys) {
       const { username, password } = data;
       
       if (!username || !password) {
-        return new Response(JSON.stringify({ error: 'Missing username or password' }), { 
-          status: 400,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        return createBadRequestResponse('Missing username or password');
       }
 
       const turnstileEnabled = sys && (sys.turnstile_enabled === 'true' || sys.turnstile_enabled === true);
@@ -68,10 +160,7 @@ export async function handleAdminAPI(request, env, sys) {
         const isTurnstileVerified = await verifyTurnstileToken(turnstileToken, turnstileSecretKey);
         
         if (!isTurnstileVerified) {
-          return new Response(JSON.stringify({ error: 'Turnstile verification failed' }), { 
-            status: 403,
-            headers: { 'Content-Type': 'application/json' }
-          });
+          return createErrorResponse(new AppError('Turnstile verification failed', 403));
         }
       }
 
@@ -85,29 +174,21 @@ export async function handleAdminAPI(request, env, sys) {
       const isValid = await validateCredentials(mockRequest, env, sys);
       
       if (!isValid) {
-        return new Response(JSON.stringify({ error: 'Invalid username or password' }), { 
-          status: 401,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        return createUnauthorizedResponse('Invalid username or password');
       }
 
       try {
         const token = await generateToken(env, sys);
-        return new Response(JSON.stringify({ 
+        return createSuccessResponse({ 
           success: true, 
           token: token,
           message: {
             en: 'Login successful',
             zh: '登录成功'
           }
-        }), {
-          headers: { 'Content-Type': 'application/json' }
         });
       } catch (e) {
-        return new Response(JSON.stringify({ error: e.message }), { 
-          status: 500,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        return createErrorResponse(e);
       }
     }
 
@@ -116,12 +197,10 @@ export async function handleAdminAPI(request, env, sys) {
     }
 
     if (data.action === 'get_settings') {
-      return new Response(JSON.stringify({
+      return createSuccessResponse({
         success: true,
         settings: sys,
         api_secret: env.API_SECRET
-      }), {
-        headers: { 'Content-Type': 'application/json' }
       });
     }
     else if (data.action === 'list') {
@@ -187,19 +266,28 @@ export async function handleAdminAPI(request, env, sys) {
         stats.avg_disk = (stats.total_disk / stats.online).toFixed(2);
       }
 
-      return new Response(JSON.stringify({
+      return createSuccessResponse({
         success: true,
         servers: serversWithStatus,
         stats
-      }), {
-        headers: { 'Content-Type': 'application/json' }
       });
+    }
+    else if (data.action === 'd1_usage') {
+      try {
+        const usage = await getD1DailyUsage(sys.cloudflare_token || '', sys.cloudflare_account_id || '');
+        return createSuccessResponse({
+          success: true,
+          usage
+        });
+      } catch (e) {
+        return createBadRequestResponse(e.message);
+      }
     }
     else if (data.action === 'save_settings') {
       const settings = data.settings || {};
 
       const APPEARANCE_FIELDS = ['site_title', 'custom_bg', 'custom_head', 'custom_script'];
-      const SITE_FIELDS = ['is_public', 'show_price', 'show_expire', 'show_bw', 'show_tf', 'tg_notify', 'tg_bot_token', 'tg_chat_id', 'turnstile_enabled', 'turnstile_site_key', 'turnstile_secret_key', 'jwt_secret', 'username', 'password', 'custom_ct', 'custom_cu', 'custom_cm', 'custom_bd'];
+      const SITE_FIELDS = ['is_public', 'show_price', 'show_expire', 'show_bw', 'show_tf', 'show_long_history', 'tg_notify', 'tg_bot_token', 'tg_chat_id', 'turnstile_enabled', 'turnstile_site_key', 'turnstile_secret_key', 'jwt_secret', 'username', 'password', 'cloudflare_account_id', 'cloudflare_token', 'custom_ct', 'custom_cu', 'custom_cm', 'custom_bd', 'cleanup_skip_count', 'expire_reminder'];
 
       const appearanceOptions = {};
       for (const field of APPEARANCE_FIELDS) {
@@ -234,26 +322,19 @@ export async function handleAdminAPI(request, env, sys) {
 
       Object.assign(sys, appearanceOptions, siteOptions);
 
-      if (settings && ('tg_notify' in settings || 'tg_bot_token' in settings || 'tg_chat_id' in settings)) {
-        clearNotificationSettingsCache();
-      }
-      return new Response(JSON.stringify({ 
+      clearSiteSettingsCache();
+      return createSuccessResponse({ 
         success: true, 
         message: {
           en: 'Update Success',
           zh: '更新成功'
         }
-      }), {
-        headers: { 'Content-Type': 'application/json' }
       });
     } 
     else if (data.action === 'add') {
       const name = data.name || 'New Server';
       if (!isValidName(name)) {
-        return new Response(JSON.stringify({ error: '服务器名称无效' }), { 
-          status: 400,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        return createBadRequestResponse('服务器名称无效');
       }
       
       const id = crypto.randomUUID();
@@ -270,24 +351,19 @@ export async function handleAdminAPI(request, env, sys) {
       
       clearServersListCache();
       
-      return new Response(JSON.stringify({ 
+      return createSuccessResponse({ 
         success: true, 
         id: id,
         message: {
           en: `Server "${name}" added`,
           zh: `服务器 "${name}" 已添加`
         }
-      }), {
-        headers: { 'Content-Type': 'application/json' }
       });
     } 
     else if (data.action === 'delete') {
       const { id } = data;
       if (!id || !isValidUUID(id)) {
-        return new Response(JSON.stringify({ error: '服务器 ID 无效' }), { 
-          status: 400,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        return createBadRequestResponse('服务器 ID 无效');
       }
       
       await env.DB.prepare('DELETE FROM metrics_history WHERE server_id = ?').bind(id).run();
@@ -296,54 +372,41 @@ export async function handleAdminAPI(request, env, sys) {
       clearServersListCache();
       clearServerDetailCache(id);
       
-      return new Response(JSON.stringify({ 
+      return createSuccessResponse({ 
         success: true, 
         message: {
           en: 'Server deleted',
           zh: '服务器已删除'
         }
-      }), {
-        headers: { 'Content-Type': 'application/json' }
       });
     } 
     else if (data.action === 'save_order') {
       const { orders } = data;
       if (!orders || !Array.isArray(orders) || orders.length === 0) {
-        return new Response(JSON.stringify({ error: '缺少排序数据' }), { 
-          status: 400,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        return createBadRequestResponse('缺少排序数据');
       }
       
       for (let i = 0; i < orders.length; i++) {
         if (!isValidUUID(orders[i])) {
-          return new Response(JSON.stringify({ error: '排序数据包含无效 ID' }), { 
-            status: 400,
-            headers: { 'Content-Type': 'application/json' }
-          });
+          return createBadRequestResponse('排序数据包含无效 ID');
         }
         await env.DB.prepare('UPDATE servers SET sort_order = ? WHERE id = ?').bind(i, orders[i]).run();
       }
       
       clearServersListCache();
       
-      return new Response(JSON.stringify({ 
+      return createSuccessResponse({ 
         success: true, 
         message: {
           en: 'Sort order saved',
           zh: '排序已保存'
         }
-      }), {
-        headers: { 'Content-Type': 'application/json' }
       });
     }
     else if (data.action === 'edit') {
       const { id, name, server_group, price, expire_date, bandwidth, traffic_limit, traffic_calc_type, reset_day, report_interval, ping_mode, is_hidden } = data;
       if (!id || !isValidUUID(id)) {
-        return new Response(JSON.stringify({ error: '服务器 ID 无效' }), { 
-          status: 400,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        return createBadRequestResponse('服务器 ID 无效');
       }
       
       try {
@@ -387,45 +450,29 @@ export async function handleAdminAPI(request, env, sys) {
         }
       } catch (e) {
         console.error('Edit server error:', e);
-        return new Response(JSON.stringify({ 
-          error: {
-            en: 'Update failed. Please go to Database Management and click "Upgrade Database" to migrate the new field.',
-            zh: '更新失败，请到数据库管理中点击"升级数据库"以迁移新字段。'
-          }
-        }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        return createErrorResponse(new Error('Update failed. Please go to Database Management and click "Upgrade Database" to migrate the new field.'));
       }
       
       clearServersListCache();
       clearServerDetailCache(id);
       
-      return new Response(JSON.stringify({ 
+      return createSuccessResponse({ 
         success: true, 
         message: {
           en: 'Server updated',
           zh: '服务器信息已更新'
         }
-      }), {
-        headers: { 'Content-Type': 'application/json' }
       });
     }
     else if (data.action === 'batch_delete') {
       const { ids } = data;
       if (!ids || !Array.isArray(ids) || ids.length === 0) {
-        return new Response(JSON.stringify({ error: '请选择要删除的服务器' }), { 
-          status: 400,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        return createBadRequestResponse('请选择要删除的服务器');
       }
       
       for (const id of ids) {
         if (!isValidUUID(id)) {
-          return new Response(JSON.stringify({ error: '包含无效的服务器 ID' }), { 
-            status: 400,
-            headers: { 'Content-Type': 'application/json' }
-          });
+          return createBadRequestResponse('包含无效的服务器 ID');
         }
       }
       
@@ -438,27 +485,19 @@ export async function handleAdminAPI(request, env, sys) {
         clearServerDetailCache(id);
       }
       
-      return new Response(JSON.stringify({ 
+      return createSuccessResponse({ 
         success: true, 
         message: {
           en: `${ids.length} server(s) deleted`,
           zh: `已删除 ${ids.length} 台服务器`
         }
-      }), {
-        headers: { 'Content-Type': 'application/json' }
       });
     }
     
-    return new Response(JSON.stringify({ error: '未知操作' }), { 
-      status: 400,
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return createBadRequestResponse('未知操作');
     
   } catch (e) {
     console.error('Admin API 错误:', e);
-    return new Response(JSON.stringify({ error: e.message }), { 
-      status: 500,
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return createErrorResponse(e);
   }
 }

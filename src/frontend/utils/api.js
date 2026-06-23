@@ -96,13 +96,21 @@ export const createLiveSocket = (subscribe, handlers = {}) => {
   }
 }
 
+export const getFlagCountryCode = (country) => {
+  const code = (country || '').toUpperCase()
+  if (code === 'TW' || code === 'HK' || code === 'MO') return 'cn'
+  return code.toLowerCase()
+}
+
 export const formatBytes = (bytes) => {
   bytes = parseFloat(bytes) || 0
   if (bytes === 0) return '0 B'
   const k = 1024
   const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
   const i = Math.floor(Math.log(bytes) / Math.log(k))
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
+  // 确保 i 在有效范围内（防止负数索引或超出数组范围）
+  const safeIndex = Math.max(0, Math.min(i, sizes.length - 1))
+  return parseFloat((bytes / Math.pow(k, safeIndex)).toFixed(2)) + ' ' + sizes[safeIndex]
 }
 
 export const fetchServers = async () => {
@@ -119,7 +127,12 @@ export const fetchServerDetail = async (id) => {
 
 export const fetchAllHistory = async (id, hours) => {
   const result = await http.get(`/api/history/all?id=${id}&hours=${hours}`)
-  if (result.error) return null
+  if (result.error) {
+    const error = new Error(result.error)
+    error.code = result.code
+    error.status = result.status
+    throw error
+  }
   return result.data
 }
 
@@ -184,7 +197,7 @@ export const fetchConfig = async () => {
 }
 
 export const upgradeDatabase = async () => {
-  const result = await http.get('/updateDatabase')
+  const result = await http.post('/updateDatabase')
   if (result.error) {
     if (result.status === 401) {
       return { success: false, error: 'Unauthorized' }
@@ -195,7 +208,7 @@ export const upgradeDatabase = async () => {
 }
 
 export const rebuildDatabase = async () => {
-  const result = await http.get('/rebuild')
+  const result = await http.post('/rebuild')
   if (result.error) {
     if (result.status === 401) {
       return { success: false, error: 'Unauthorized' }

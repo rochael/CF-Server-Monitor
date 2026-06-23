@@ -1,11 +1,9 @@
-import { getLatestMetricsForAllServers, getAllServers } from '../database/schema.js';
+import { getLatestMetricsForAllServers } from '../database/schema.js';
+import { getAllServers } from '../utils/cache.js';
+import { loadSiteSettings, clearSiteSettingsCache, debug } from '../utils/settings.js';
 
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000;
-
-let cachedSettings = null;
-let cacheExpiry = 0;
-const CACHE_TTL = 60 * 1000;
 
 async function fetchWithRetry(url, options, retries = MAX_RETRIES) {
   for (let i = 0; i < retries; i++) {
@@ -27,87 +25,65 @@ async function fetchWithRetry(url, options, retries = MAX_RETRIES) {
   throw new Error('Max retries exceeded');
 }
 
-async function loadNotificationSettings(db) {
-  const now = Date.now();
-  if (cachedSettings && now < cacheExpiry) {
-    return cachedSettings;
-  }
 
-  const defaults = { tg_notify: 'false', tg_bot_token: '', tg_chat_id: '' };
-
-  try {
-    const row = await db.prepare(
-      "SELECT value FROM settings WHERE key = 'site_options'"
-    ).first();
-
-    if (row) {
-      try {
-        const parsed = JSON.parse(row.value);
-        const settings = {
-          tg_notify: parsed.tg_notify || defaults.tg_notify,
-          tg_bot_token: parsed.tg_bot_token || defaults.tg_bot_token,
-          tg_chat_id: parsed.tg_chat_id || defaults.tg_chat_id
-        };
-        cachedSettings = settings;
-        cacheExpiry = now + CACHE_TTL;
-        return settings;
-      } catch (e) {
-        // JSON 解析失败，降级到独立 key
-      }
+export async function sendNotification(settings, msg) {
+  if(!settings.tg_bot_token) return;
+  if(settings.tg_chat_id) {
+    try {
+      await fetchWithRetry(`https://api.telegram.org/bot${settings.tg_bot_token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: settings.tg_chat_id,
+          text: msg,
+          parse_mode: 'Markdown'
+        })
+      });
+    } catch (e) {
+      console.error('Telegram 通知发送失败:', e);
     }
-  } catch (e) {
-    console.error('加载通知设置失败:', e);
-  }
-
-  cachedSettings = defaults;
-  cacheExpiry = now + CACHE_TTL;
-  return defaults;
-}
-
-export function clearNotificationSettingsCache() {
-  cachedSettings = null;
-  cacheExpiry = 0;
-}
-
-export async function sendTelegramNotification(settings, msg) {
-  if (settings.tg_notify !== 'true' || !settings.tg_bot_token || !settings.tg_chat_id) return;
-  
-  try {
-    await fetchWithRetry(`https://api.telegram.org/bot${settings.tg_bot_token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: settings.tg_chat_id,
-        text: msg,
-        parse_mode: 'Markdown'
-      })
-    });
-  } catch (e) {
-    console.error('Telegram 通知发送失败:', e);
-  }
-}
-
-export async function sendWeworkNotification(settings, msg) {
-  if (settings.tg_notify !== 'true' || !settings.tg_bot_token) return;
-
-  try {
-    await fetchWithRetry(settings.tg_bot_token, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        msgtype: "markdown",
-        markdown: { content: msg }
-      })
-    });
-  } catch (e) {
-    console.error('企业微信通知发送失败:', e);
+  }else{
+    try {
+      await fetchWithRetry(settings.tg_bot_token, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          msgtype: "markdown",
+          markdown: { content: msg }
+        })
+      });
+    } catch (e) {
+      console.error('企业微信通知发送失败:', e);
+    }
   }
 }
 
 export async function checkOfflineNodes(db) {
-  const notifySettings = await loadNotificationSettings(db);
-  if (notifySettings.tg_notify !== 'true') return;
-  
+  const siteSettings = await loadSiteSettings(db);
+
+  if (siteSettings.tg_notify !== 'true'|| !siteSettings.tg_bot_token) return;
+
+  const skipCount = parseInt(siteSettings.cleanup_skip_count || '0', 10) || 0;
+  debug(`[Cron] 检测到当前跳过次数: ${skipCount}`);
+  if (skipCount > 0) {
+    debug(`[Cron] 检测到表轮换进行中，跳过离线检测（剩余跳过次数: ${6 - skipCount}）`);
+    
+    const newCount = skipCount + 1;
+    const finalCount = newCount > 5 ? 0 : newCount;
+    
+    const siteOptionsResult = await db.prepare('SELECT value FROM settings WHERE key = ?').bind('site_options').first();
+    const siteOptions = siteOptionsResult && siteOptionsResult.value && siteOptionsResult.value.length > 0 
+      ? JSON.parse(siteOptionsResult.value) 
+      : {};
+    siteOptions.cleanup_skip_count = String(finalCount);
+    await db.prepare(
+      'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+    ).bind('site_options', JSON.stringify(siteOptions)).run();
+    
+    clearSiteSettingsCache();
+    return;
+  }
+
   try {
     const allServers = await getAllServers(db);
     
@@ -126,8 +102,9 @@ export async function checkOfflineNodes(db) {
       }
     }
 
-    let stateChanged = false;
     const now = Date.now();
+    const offlineNodes = [];
+    const recoveredNodes = [];
 
     for (const s of allServers) {
       const latestMetrics = latestMetricsMap.get(s.id);
@@ -139,36 +116,71 @@ export async function checkOfflineNodes(db) {
       }
 
       if (isOffline && !alertState[s.id]) {
-        const msg = `⚠️ **节点离线告警**\n\n` +
-          `**节点名称:** ${s.name}\n` +
-          `**状态:** 离线 (超过5分钟未上报)\n` +
-          `**时间:** ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`;
-        
-        await sendTelegramNotification(notifySettings, msg);
-        await sendWeworkNotification(notifySettings, msg);
-        
+        offlineNodes.push(s);
         alertState[s.id] = true;
-        stateChanged = true;
       } else if (!isOffline && alertState[s.id]) {
-        const msg = `✅ **节点恢复通知**\n\n` +
-          `**节点名称:** ${s.name}\n` +
-          `**状态:** 恢复在线\n` +
-          `**时间:** ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`;
-        
-        await sendTelegramNotification(notifySettings, msg);
-        await sendWeworkNotification(notifySettings, msg);
-        
+        recoveredNodes.push(s);
         delete alertState[s.id];
-        stateChanged = true;
       }
     }
 
-    if (stateChanged) {
+    if (offlineNodes.length > 0) {
+      const nodeList = offlineNodes.map(n => `• ${n.name}`).join('\n');
+      const msg = `⚠️ **节点离线告警** (${offlineNodes.length}个)\n\n${nodeList}\n\n**时间:** ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`;
+      await sendNotification(siteSettings, msg);
+    }
+
+    if (recoveredNodes.length > 0) {
+      const nodeList = recoveredNodes.map(n => `• ${n.name}`).join('\n');
+      const msg = `✅ **节点恢复通知** (${recoveredNodes.length}个)\n\n${nodeList}\n\n**时间:** ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`;
+      await sendNotification(siteSettings, msg);
+    }
+
+    if (offlineNodes.length > 0 || recoveredNodes.length > 0) {
       await db.prepare(
         'INSERT INTO settings (key, value) VALUES ("alert_state", ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
       ).bind(JSON.stringify(alertState)).run();
     }
   } catch (e) {
     console.error('离线检测失败:', e);
+  }
+}
+
+export async function checkExpiringServers(db) {
+  const siteSettings = await loadSiteSettings(db);
+
+  if (siteSettings.expire_reminder !== 'true' || !siteSettings.tg_bot_token) {
+    return;
+  }
+  try {
+    const allServers = await getAllServers(db);
+    const now = Date.now();
+    const REMINDER_DAYS = 7;
+    const expiringServers = [];
+
+    for (const s of allServers) {
+      if (!s.expire_date) continue;
+
+      const expTime = new Date(s.expire_date).getTime();
+      if (isNaN(expTime)) continue;
+
+      const diff = expTime - now;
+      const days = Math.ceil(diff / (1000 * 3600 * 24));
+
+      debug(`[Cron] 检测到服务器 ${s.name} 到期日期 ${s.expire_date}，剩余天数 ${days} 天`);
+
+      if (days > 0 && days <= REMINDER_DAYS) {
+        expiringServers.push({ name: s.name, expire_date: s.expire_date, days });
+      }
+    }
+
+    if (expiringServers.length > 0) {
+      const serverList = expiringServers.map(s => `• ${s.name} - 剩余${s.days}天 (${s.expire_date})`).join('\n');
+      const msg = `⏰ **服务器到期提醒** (${expiringServers.length}个)\n\n${serverList}`;
+      debug(`[Cron] 发送到期提醒通知: ${msg}`);
+      await sendNotification(siteSettings, msg);
+    }
+  } catch (e) {
+    console.error('到期检测失败:', e);
   }
 }

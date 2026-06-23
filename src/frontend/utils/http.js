@@ -50,15 +50,22 @@ const handleResponse = async (res, options = {}) => {
   
   if (!res.ok) {
     let errorMessage = DEFAULT_ERROR_MESSAGES[res.status] || 'Request failed'
+    let errorCode = res.status
     try {
       const data = await res.json()
       if (data.error) {
         errorMessage = data.error
       }
+      if (data.code) {
+        errorCode = data.code
+        if (!data.error && typeof data.code === 'string') {
+          errorMessage = data.code
+        }
+      }
     } catch (e) {
       // ignore
     }
-    return { error: errorMessage, status: res.status }
+    return { error: errorMessage, code: errorCode, status: res.status }
   }
   
   try {

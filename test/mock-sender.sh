@@ -2,6 +2,7 @@
 # macOS模拟数据发送脚本
 # 用于测试 CF-Server-Monitor 工作原理
 # bash test/mock-sender.sh 550e8400-e29b-41d4-a716-446655440001 123456 http://localhost:8787/update 10
+# curl -X POST http://localhost:8787/update -H "Content-Type: application/json" -d '{"id":"550e8400-e29b-41d4-a716-446655440001","secret":"123456","metrics":{"cpu":"45.5","ram":"60.2","disk":"35.8"}}'
 
 set -euo pipefail
 
@@ -35,7 +36,7 @@ escape_json() {
     val="${val//\"/\\\"}"
     val="${val//$'\n'/ }"
     val="${val//$'\r'/}"
-    echo -n "$val"
+    printf '%s' "$val"
 }
 
 echo -e "${BLUE}╔══════════════════════════════════════════════════╗${NC}"
@@ -55,6 +56,7 @@ while true; do
     LOOP_START_TIME=$(date +%s)
     
     CPU=$(generate_random 5 85)
+    GPU=$(generate_random 0 95)
     RAM=$(generate_random 20 80)
     RAM_TOTAL=$(generate_int 8 64)
     RAM_USED=$(awk -v total="$RAM_TOTAL" -v pct="$RAM" 'BEGIN{printf "%d", total * pct / 100}')
@@ -71,6 +73,8 @@ while true; do
     OS="$(sw_vers -productName 2>/dev/null || echo "macOS") $(sw_vers -productVersion 2>/dev/null || echo "14.0")"
     ARCH=$(uname -m)
     CPU_INFO=$(sysctl -n machdep.cpu.brand_string 2>/dev/null | head -n1 || echo "$ARCH")
+    GPU_INFO=$(system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Chipset Model|GPU/{print $2; exit}' || echo "Mock GPU")
+    [ -z "${GPU_INFO:-}" ] && GPU_INFO="Mock GPU"
     CPU_CORES=$(sysctl -n hw.ncpu 2>/dev/null || echo "4")
     PROCESSES=$(ps aux | wc -l | tr -d ' ')
     TCP_CONN=$(netstat -an -p tcp 2>/dev/null | grep -c ESTABLISHED || generate_int 10 100)
@@ -100,6 +104,10 @@ while true; do
     PING_CU=$(generate_int 20 200)
     PING_CM=$(generate_int 30 250)
     PING_BD=$(generate_int 50 300)
+    LOSS_CT=$(generate_int 0 8)
+    LOSS_CU=$(generate_int 0 12)
+    LOSS_CM=$(generate_int 0 10)
+    LOSS_BD=$(generate_int 0 15)
     
     NET_RX_MONTHLY=$(generate_int 100000000 1500000000)
     NET_TX_MONTHLY=$(generate_int 150000000 750000000)
@@ -107,16 +115,17 @@ while true; do
     EOS=$(escape_json "${OS}")
     EARCH=$(escape_json "${ARCH}")
     ECPU=$(escape_json "${CPU_INFO}")
+    EGPU=$(escape_json "${GPU_INFO}")
     
     PAYLOAD=$(cat <<EOF
-{"id":"$SERVER_ID","secret":"$SECRET","metrics":{"cpu":"$CPU","ram":"$RAM","ram_total":"$RAM_TOTAL","ram_used":"$RAM_USED","swap_total":"$SWAP_TOTAL","swap_used":"$SWAP_USED","disk":"$DISK","disk_total":"$DISK_TOTAL","disk_used":"$DISK_USED","load_avg":"$LOAD_AVG","boot_time":"$BOOT_TIME","net_rx":"$RX_NOW","net_tx":"$TX_NOW","net_rx_monthly":"$NET_RX_MONTHLY","net_tx_monthly":"$NET_TX_MONTHLY","net_in_speed":"$RX_SPEED","net_out_speed":"$TX_SPEED","os":"$EOS","arch":"$EARCH","cpu_info":"$ECPU","cpu_cores":"$CPU_CORES","processes":"$PROCESSES","tcp_conn":"$TCP_CONN","udp_conn":"$UDP_CONN","ip_v4":"$IPV4","ip_v6":"$IPV6","ping_ct":"$PING_CT","ping_cu":"$PING_CU","ping_cm":"$PING_CM","ping_bd":"$PING_BD"}}
+{"id":"$SERVER_ID","secret":"$SECRET","metrics":{"cpu":"$CPU","gpu":"$GPU","gpu_info":"$EGPU","ram":"$RAM","ram_total":"$RAM_TOTAL","ram_used":"$RAM_USED","swap_total":"$SWAP_TOTAL","swap_used":"$SWAP_USED","disk":"$DISK","disk_total":"$DISK_TOTAL","disk_used":"$DISK_USED","load_avg":"$LOAD_AVG","boot_time":"$BOOT_TIME","net_rx":"$RX_NOW","net_tx":"$TX_NOW","net_rx_monthly":"$NET_RX_MONTHLY","net_tx_monthly":"$NET_TX_MONTHLY","net_in_speed":"$RX_SPEED","net_out_speed":"$TX_SPEED","os":"$EOS","arch":"$EARCH","cpu_info":"$ECPU","cpu_cores":"$CPU_CORES","processes":"$PROCESSES","tcp_conn":"$TCP_CONN","udp_conn":"$UDP_CONN","ip_v4":"$IPV4","ip_v6":"$IPV6","ping_ct":"$PING_CT","ping_cu":"$PING_CU","ping_cm":"$PING_CM","ping_bd":"$PING_BD","loss_ct":"$LOSS_CT","loss_cu":"$LOSS_CU","loss_cm":"$LOSS_CM","loss_bd":"$LOSS_BD"}}
 EOF
 )
     
     RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" -d "$PAYLOAD" -m 5 --connect-timeout 2 "$WORKER_URL" 2>/dev/null || echo "000")
     
     if [ "$RESPONSE" = "200" ] || [ "$RESPONSE" = "201" ]; then
-        info "[$(date '+%Y-%m-%d %H:%M:%S')] 数据上报成功 - CPU: ${CPU}% | RAM: ${RAM}% | Disk: ${DISK}%"
+        info "[$(date '+%Y-%m-%d %H:%M:%S')] 数据上报成功 - CPU: ${CPU}% | GPU: ${GPU}% | Loss CT: ${LOSS_CT}% | RAM: ${RAM}% | Disk: ${DISK}%"
     else
         warn "[$(date '+%Y-%m-%d %H:%M:%S')] 数据上报失败 (HTTP: $RESPONSE)"
     fi

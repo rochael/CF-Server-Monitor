@@ -103,8 +103,8 @@ async function initApp() {
         loading.innerHTML = `
           <div class="loading-content">
             <div style="font-size: 48px; margin-bottom: 16px;">❌</div>
-            <div class="loading-text" style="color: #f85149;">${trans().errorInvalidUsername || 'Verification failed'}</div>
-            <div style="font-size: 12px; color: #6b7280; margin-top: 8px;">${trans().loginRequired || 'Please refresh the page to try again'}</div>
+            <div class="loading-text" style="color: #f85149;">${trans().verificationFailed}</div>
+            <div style="font-size: 12px; color: #6b7280; margin-top: 8px;">${trans().refreshToRetry}</div>
           </div>
         `
         return
@@ -114,7 +114,7 @@ async function initApp() {
       loading.innerHTML = `
         <div class="loading-content">
           <div style="font-size: 48px; margin-bottom: 16px;">❌</div>
-          <div class="loading-text" style="color: #f85149;">${trans().errorInvalidUsername || 'Verification error'}</div>
+          <div class="loading-text" style="color: #f85149;">${trans().verificationError}</div>
           <div style="font-size: 12px; color: #6b7280; margin-top: 8px;">${e.message}</div>
         </div>
       `

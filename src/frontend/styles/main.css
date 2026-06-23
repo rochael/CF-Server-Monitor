@@ -425,6 +425,12 @@ body::before {
     letter-spacing: 0.5px;
 }
 
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
 .btn:hover {
     background: var(--bg-hover);
     border-color: var(--border-active);
@@ -633,6 +639,16 @@ body::before {
     border-radius: 1px;
 }
 
+.filter-tag-unknown {
+    border-style: dashed;
+    opacity: 0.85;
+}
+
+.filter-tag-icon {
+    font-size: 13px;
+    line-height: 1;
+}
+
 /* --------------------------------------------------------------------------
    11. Stats Components
    -------------------------------------------------------------------------- */
@@ -695,6 +711,41 @@ body::before {
 
 .stat-card .stat-label {
     margin-top: 4px;
+}
+
+.quota-progress-list {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.quota-progress-bar {
+    height: 10px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+.quota-progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent-green), var(--accent-cyan));
+    border-radius: 999px;
+    transition: width 0.3s ease;
+}
+
+.quota-section {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    padding: 16px;
+}
+
+.quota-section-title {
+    font-weight: 600;
+    color: var(--accent-cyan);
+    margin-bottom: 12px;
+    font-size: 14px;
 }
 
 /* --------------------------------------------------------------------------
@@ -912,7 +963,7 @@ body::before {
 
 .terminal-table th {
     background: var(--bg-card);
-    padding: 10px 4px;
+    padding: 10px 10px;
     text-align: left;
     color: var(--text-primary);
     font-weight: 600;
@@ -923,7 +974,7 @@ body::before {
 }
 
 .terminal-table td {
-    padding: 10px 4px;
+    padding: 10px 10px;
     border-bottom: 1px solid var(--border-color);
     vertical-align: middle;
 }
@@ -1583,6 +1634,10 @@ body::before {
     font-size: 14px;
 }
 
+.chart-current-value-container {
+    text-align: right;
+}
+
 .chart-current-value {
     font-size: 14px;
     font-weight: 700;
@@ -1776,6 +1831,7 @@ body::before {
 }
 
 .bg-preview {
+    max-width: 100%;
     max-height: 80px;
     border-radius: 4px;
     margin-top: 8px;
@@ -1862,101 +1918,6 @@ body::before {
 ::-webkit-scrollbar-thumb:hover {
     background: var(--border-active);
 }
-
-/* --------------------------------------------------------------------------
-   36. Responsive Styles
-   -------------------------------------------------------------------------- */
-
-/* Tablet */
-@media (max-width: 1200px) {
-    .charts-container {
-        grid-template-columns: 1fr;
-    }
-}
-
-/* Mobile */
-@media (max-width: 768px) {
-    .container {
-        padding: 8px;
-    }
-
-    .btn, .tab-btn{
-        padding: 8px;
-    }
-
-    .terminal-dots{
-        gap: 3px;
-        width: auto;
-    }
-
-    .terminal-dot{
-        width: 6px;
-        height: 6px;
-    }
-
-    .terminal-title{
-        display: none;
-    }
-
-    .lang-toggle, .theme-toggle{
-        padding: 0;
-    }
-
-    .terminal-header-controls{
-        gap: 8px;
-    }
-
-    .servers-grid {
-        grid-template-columns: 1fr;
-    }
-
-    .global-stats {
-        grid-template-columns: 1fr;
-    }
-
-    .ping-panel {
-        grid-template-columns: repeat(2, 1fr);
-    }
-
-    .stats-grid {
-        grid-template-columns: repeat(2, 1fr);
-    }
-
-    .toolbar-input {
-        width: 100%;
-    }
-
-    .sysinfo-grid {
-        grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-    }
-
-    .time-selector {
-        overflow-x: auto;
-        width: 100%;
-    }
-
-    .time-btn {
-        padding: 6px 10px;
-        font-size: 11px;
-    }
-
-    .host-card-header {
-        padding: 12px 14px;
-    }
-
-    .chart-body canvas {
-        height: 180px !important;
-    }
-
-    .settings-grid {
-        grid-template-columns: 1fr;
-    }
-
-    .view-panel {
-        min-height: 0;
-    }
-}
-
 
 
 /* --------------------------------------------------------------------------
@@ -2275,6 +2236,7 @@ body::before {
 
 .ping-indicator {
     display: flex;
+    flex-wrap: wrap;
     gap: 20px;
     font-size: 11px;
     font-weight: 500;
@@ -2574,4 +2536,137 @@ body::before {
 
 .checkbox-accent-green {
     accent-color: var(--accent-green);
+}
+
+
+/* --------------------------------------------------------------------------
+   36. Responsive Styles
+   -------------------------------------------------------------------------- */
+
+/* Tablet */
+@media (max-width: 1200px) {
+    .charts-container {
+        grid-template-columns: 1fr;
+    }
+
+    .settings-grid {
+        gap: 12px;
+    }
+}
+
+/* Mobile */
+@media (max-width: 768px) {
+    .container {
+        padding: 8px;
+    }
+
+    .btn, .tab-btn{
+        padding: 8px;
+    }
+
+    .terminal-dots{
+        gap: 3px;
+        width: auto;
+    }
+
+    .terminal-dot{
+        width: 6px;
+        height: 6px;
+    }
+
+    .terminal-title{
+        display: none;
+    }
+
+    .lang-toggle, .theme-toggle{
+        padding: 0;
+    }
+
+    .terminal-header-controls{
+        gap: 8px;
+    }
+
+    #map-container {
+        height: 260px;
+    }
+
+    .servers-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .global-stats {
+        grid-template-columns: 1fr;
+    }
+
+    .ping-panel {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    .stats-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    .toolbar-input {
+        width: 100%;
+    }
+
+    .sysinfo-grid {
+        grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    }
+
+    .time-selector {
+        overflow-x: auto;
+        width: 100%;
+    }
+
+    .time-btn {
+        padding: 6px 10px;
+        font-size: 11px;
+    }
+
+    .host-card-header {
+        padding: 12px 14px;
+    }
+
+    .chart-body canvas {
+        height: 180px !important;
+    }
+
+    .settings-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .settings-section {
+        margin-bottom: 12px;
+    }
+
+    .settings-grid .form-row {
+        flex-direction: column;
+        gap: 8px;
+    }
+
+    .settings-section .flex[style*="gap"] {
+        flex-direction: column;
+    }
+
+    .settings-section .flex[style*="gap"] .form-input,
+    .settings-section .flex[style*="gap"] > * {
+        width: 100%;
+    }
+
+    .tab-content .text-right {
+        text-align: center;
+    }
+
+    .tab-content .text-right .btn {
+        width: 100%;
+    }
+
+    .view-panel {
+        min-height: 0;
+    }
+    .btn-lg {
+        font-size: 12px;
+        padding: 12px;
+    }
 }

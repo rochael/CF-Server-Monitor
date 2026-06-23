@@ -1,10 +1,44 @@
 # [CF-Server-Monitor](https://github.com/huilang-me/CF-Server-Monitor)
 
-一个基于 Cloudflare Workers + D1 的多服务器监控探针系统，支持实时监控、历史数据查看、延迟追踪、地图展示等功能。兼容主流Linux系统，Alpine Linux，OpenWrt，Windows系统。**演示地址**：<https://tz.dashdeep.dpdns.org/>
+一个基于 Cloudflare Workers + D1 + Durable Objects 的多服务器监控探针系统，支持实时监控、历史数据查看、延迟追踪、地图展示等功能。兼容主流Linux系统，Alpine Linux，OpenWrt，Windows系统。**演示地址**：<https://tz.dashdeep.dpdns.org/>
 
-**当前版本：V2.6.9**
+**当前版本：V2.7.3.3**
 
-- v2.6.8 修复网卡统计误统计非目标网卡流量的问题,修复Alpine环境UDP连接数统计错误,本次更新需要重新安装脚本才能生效
+<2.7.1 新增了功能，需要**升级安装脚本** & **后台升级数据库** 才能生效，否则会产生数据库结构错误或者图表显示异常
+```
+# Linux
+curl -sL https://你的项目.你的子域.workers.dev/install.sh | bash -s install
+# Alpine
+curl -sL https://你的项目.你的子域.workers.dev/install-alpine.sh | sh -s install
+# OpenWrt
+curl -sL https://你的项目.你的子域.workers.dev/install-openwrt.sh | sh -s install
+```
+<= 2.6.9 版本,使用方式一部署方式，需要在Workers & Pages页面，点击 **Settings**，修改Build configuration的Deploy command为：`npx wrangler deploy --keep-vars`，否则会导致API\_SECRET丢失。旧key可用通过
+```
+# Linux
+cat /etc/systemd/system/cf-probe.service
+# OpenWrt,Alpine
+cat /etc/init.d/cf-probe
+# >2.6.9版本
+cat /etc/config/cf-probe/config.conf
+```
+获取，再重新设置环境变量API\_SECRET（注意是设置顶部的变量和密钥），最后再同步数据。
+
+
+<details>
+<summary>更新记录</summary>
+
+- V2.7.3.3 压缩定时任务4个为2个，避免超出免费额度
+- V2.7.3.2 合并通知告警，其他代码逻辑优化
+- V2.7.3.1 当request.cf返回`cf object not available`错误，导致国家/地区代码获取失败，使用request.headers获取作为备选
+- V2.7.3 新增服务器到期提醒功能，调整后台设置页面布局
+- V2.7.2 新增支持多分区磁盘统计功能以及其他优化，增加[图文教程](https://huilang.me/cf-server-monitor-setup/)
+- V2.7.1 新增国内四线路丢包率监控与历史图表，新增GPU字段与图表展示（GPU暂未测试），后台新增 Cloudflare D1/Workers 每日额度查询功能；
+
+- V2.7.0 将每日数据清理改为每月1号执行的表轮换任务, 删除旧表将不再扣除D1消耗,前端图表支持查看最长7天的历史数据,优化脚本一键升级功能
+- V2.6.10 修复了方式一部署方式，同步后丢失API\_SECRET的问题
+- V2.6.9 修复地图显示问题，重构OpenWrt安装脚本，新增OpenRC服务支持
+- V2.6.8 修复网卡统计误统计非目标网卡流量的问题,修复Alpine环境UDP连接数统计错误,本次更新需要重新安装脚本才能生效
 - v2.6.7 增加了月流量统计校正功能，以及首页流量统计展示
 - v2.6.6 增加上报间隔，Ping方式，流量重置日入库功能
 - V2.6.5 修复了部分系统启动时间获取错误的问题，TCP/UDP上报格式错误导致失败问题，新增详情页面实时网速展示
@@ -13,22 +47,24 @@
 - V2.6.0 降低了 50% 的D1写入消耗，强烈建议升级，升级后请在后台手动点击 升级数据库 或者 重建数据库 。
 - V2.5.0 增加客户端上报数据后，在不占用D1消耗的情况下，前端WebSocket实时刷新数据
 - V2.4.0 版本主要优化了D1读写占用，使项目消耗大大降低，以及增加了防护避免被刷。
+</details>
 
 ## ✨ 功能特点
 
-- 📊 **实时监控**：CPU、内存、磁盘、网络、进程数、连接数、负载均衡
-- 📈 **历史图表**：支持 1/3/6/12/24 小时历史数据查看
+- 📊 **实时监控**：CPU、GPU、内存、磁盘、网络、进程数、连接数、负载均衡
+- 📈 **历史图表**：支持7天历史数据查看
 - 🌍 **全球地图**：可视化展示服务器分布
 - 🔔 **离线告警**：支持 Telegram 和企业微信通知
 - 📱 **响应式**：支持桌面端和移动端
 - 🔄 **自动部署**：GitHub Actions 一键部署
-- 🗺️ **延迟追踪**：国内电信/联通/移动/字节延迟监测
+- 🗺️ **网络质量追踪**：国内电信/联通/移动/字节延迟与丢包率监测
 - 🔒 **服务器隐藏**：可设置特定服务器对非登录用户隐藏
 - ↕️ **拖拽排序**：后台拖拽调整服务器显示顺序
 - 🌐 **双语支持**：支持中文和英文界面自由切换
 - 🧪 **本地测试**：支持本地模拟数据生成，方便开发和测试
 - 🔐 **Turnstile 验证**：集成 Cloudflare Turnstile 人机验证，增强 API 安全性
 - 🔑 **JWT 认证**：登录系统采用 JWT token 认证，支持自定义密钥
+- 📉 **额度查询**：后台可查询 Cloudflare D1 当日读写行数与 Workers 请求量
 - ⚡ **实时推送**：基于 Durable Objects + WebSocket，探针上报后页面立即刷新，无轮询延迟
 
 ## 🚀 快速开始
@@ -39,7 +75,7 @@
 - [GitHub 账户](https://github.com/)
 
 <details>
-<summary>方式一：Cloudflare Workers 连接GitHub仓库（推荐使用，方便同步）</summary>
+<summary>方式一：Cloudflare Workers 连接GitHub仓库（推荐使用，方便同步）图文教程 -> https://huilang.me/cf-server-monitor-setup/</summary>
 
 ### 第一步：Fork 项目
 
@@ -51,9 +87,10 @@
 2. 进入 **[Workers & Pages](https://dash.cloudflare.com/?to=/:account/workers-and-pages)**
 3. 点击 **Create application**
 4. 选择 Continue with GitHub（第一次使用需要连接 GitHub 账户），选择本项目
-5. Project Name填写：`cf-server-monitor`,小写即可，可按自己需求设置
+5. Project Name填写：`cf-server-monitor`
 6. Build command 填写：`npm run build:frontend`
-7. 点击 **Deploy**，成功会在底部显示`✨ Success! Build completed.`
+7. Deploy command 填写：`npx wrangler deploy --keep-vars`
+8. 点击 **Deploy**，成功会在底部显示`✨ Success! Build completed.`
 
 ### 第三步：配置环境变量
 
@@ -316,48 +353,34 @@ git push origin main
 <details>
 <summary>升级探针</summary>
 
-当有新版本发布时，可以通过以下命令升级探针，升级过程会自动保留原有配置：
-
-Ubuntu / Debian / CentOS / RHEL / Fedora / Rocky / AlmaLinux 系统
+当有新版本部署成功后，可以通过以下命令升级探针，升级过程会自动保留原有配置：
 
 ```bash
-curl -sL https://你的项目.你的子域.workers.dev/install.sh | bash -s update https://你的项目.你的子域.workers.dev/install.sh
+# Linux
+curl -sL https://你的项目.你的子域.workers.dev/install.sh | bash -s install
+# Alpine
+curl -sL https://你的项目.你的子域.workers.dev/install-alpine.sh | sh -s install
+# OpenWrt
+curl -sL https://你的项目.你的子域.workers.dev/install-openwrt.sh | sh -s install
 ```
+为了安全，没有提供自动升级功能，如有需要自行将升级脚本加入服务器定时任务。
 
-Alpine 系统
-
+比如 crontab -e 中添加以下内容，每天凌晨 0 点执行升级：
 ```bash
-curl -sL https://你的项目.你的子域.workers.dev/install-alpine.sh | sh -s update https://你的项目.你的子域.workers.dev/install-alpine.sh
+# Linux
+0 0 * * * curl -sL https://你的项目.你的子域.workers.dev/install.sh | bash -s install
 ```
-
-OpenWrt / LEDE / ImmortalWrt 系统
-
-```bash
-curl -sL https://你的项目.你的子域.workers.dev/install-openwrt.sh | sh -s update https://你的项目.你的子域.workers.dev/install-openwrt.sh
-```
-
-> **注意**：升级命令需要两次传入脚本 URL，第一次通过管道传入脚本本身，第二次作为 update 命令的参数指定更新源 URL。
-
 </details>
 
 <details>
 <summary>卸载探针</summary>
 
-Ubuntu / Debian / CentOS / RHEL / Fedora / Rocky / AlmaLinux 系统
-
 ```bash
+# Linux
 curl -sL https://你的项目.你的子域.workers.dev/install.sh | bash -s uninstall
-```
-
-Alpine 系统
-
-```bash
+# Alpine
 curl -sL https://你的项目.你的子域.workers.dev/install-alpine.sh | sh -s uninstall
-```
-
-OpenWrt / LEDE / ImmortalWrt 系统
-
-```bash
+# OpenWrt
 curl -sL https://你的项目.你的子域.workers.dev/install-openwrt.sh | sh -s uninstall
 ```
 
@@ -383,8 +406,17 @@ Windows 系统
 如需自定义 JWT 密钥：
 
 1. 生成一个至少 32 位的随机字符串作为 JWT Secret
-2. 在管理后台 → 全局设置中填入 JWT Secret
+2. 在管理后台 → 全局设置 → 安全设置中填入 JWT Secret
 3. 保存后系统将使用自定义密钥进行 token 签名
+
+### Cloudflare 额度查询（可选）
+
+如需在后台查询 D1 当日读写额度和 Workers 请求量：
+
+1. 在 [Cloudflare Dashboard](https://dash.cloudflare.com/?to=/:account/workers-and-pages)右下角复制当前账户的 **Account ID**
+2. 在[API Tokens 页面](https://dash.cloudflare.com/profile/api-tokens)创建具备 **Account Analytics Read** 权限的 Cloudflare API Token
+3. 在管理后台 → 全局设置 → Cloudflare 设置中填入 Account ID 和 API Token
+4. 保存后点击 **查询 D1 额度** 查看 UTC 当日用量与下次重置时间
 
 </details>
 
@@ -404,10 +436,10 @@ Windows 系统
 
 点击任意服务器卡片进入详情页：
 
-- 实时 CPU/内存/磁盘/网络/负载
-- 1/3/6/12/24 小时历史趋势图
+- 实时 CPU/GPU/内存/磁盘/网络/负载
+- 7天历史趋势图
 - 鼠标悬停查看具体时间点的数值
-- 国内三大运营商延迟追踪
+- 国内四线路延迟与丢包率追踪
 
 > **注意**：查看1小时以上的历史数据需要登录管理员账户。
 
@@ -445,6 +477,7 @@ Windows 系统
 >
 > - 重建数据库是不可逆操作，请确保已备份重要数据
 > - 升级数据库不会删除现有数据，仅会更新表结构
+> - 从旧版本升级到包含 GPU/丢包率监控的新版本后，需要先执行升级数据库，再重新安装或升级探针以采集新字段
 
 ## 🔔 离线告警配置
 
@@ -470,10 +503,10 @@ Windows 系统
 
 系统包含以下定时任务（UTC 时区）：
 
-| 任务   | 触发时间          | 说明                       |
-| ---- | ------------- | ------------------------ |
-| 数据清理 | `50 23 * * *` | 每天UTC 23:50 清理 3 天前的历史数据 |
-| 离线检测 | `*/1 * * * *` | 每分钟检测离线节点并发送告警           |
+| 任务   | 触发时间          | 说明                                    |
+| ---- | ------------- | ------------------------------------- |
+| 离线检测 | `*/1 * * * *` | 每分钟检测离线节点并发送告警 |
+| 合并任务 | `0 * * * *`   | 每小时执行，根据日期判断执行：每月1号数据轮换、每月8号清理旧表、每天12:00服务器到期检测 |
 
 </details>
 
@@ -553,7 +586,10 @@ CF-Server-Monitor/
 
 **Q: 部署后返回API\_SECRET is required**
 
+如果是部署后丢失API\_SECRET，请在Workers & Pages页面，点击 **Settings**，修改Build configuration的Deploy command为：`npx wrangler deploy --keep-vars`，重新设置API\_SECRET，下次部署会继续保留。旧key可用通过`cat /etc/systemd/system/cf-probe.service`或者`cat /etc/init.d/cf-probe`获取。
+
 如果是GitHub Action 自动部署，确保在 GitHub Secrets 中设置了 API\_SECRET 密钥。
+
 如果是一键部署，确保在Cloudflare Workers & Pages 中设置了 API\_SECRET 密钥。
 
 **Q: 探针安装后不显示数据？**
@@ -568,7 +604,7 @@ CF-Server-Monitor/
 
 Cloudflare D1 免费版提供 5GB 存储和 5M 读取行/日、100K 写入行/日，足以支持服务器监控。
 
-写入行：~~1台服务器一天占用写入行是2.88k，免费写入额度是100k/天，理论上可用支持34台服务器的监控，如果修改上报频率为120秒可用翻倍。~~  计算错误了，D1定时删除日志也算写入行，所以一台服务器一天需要5.76k，理论上支持17台。后续看看能不能继续优化。
+写入行：1台服务器一天占用写入行是2.88k，免费写入额度是100k/天，理论上可用支持34台服务器的监控，如果修改上报频率为120秒可用翻倍。
 
 读取行：1台服务器一天占用读行是8k左右，如果开启站点兼容，大概是1.6k，免费读行是5M/天，非常充裕
 主要是前端访问消耗的次数，限制了非登录用户1小时以上的查看，只要不被暴力刷额度，绝对够用，如果不放心，可用在后台开启Turnstile人机验证，或者也可以选择仅登录查看
@@ -645,6 +681,16 @@ npm run build:frontend
 
 # 部署到 Cloudflare Workers
 npm run deploy
+```
+
+定时任务
+
+```
+http://localhost:8787/cdn-cgi/handler/scheduled?cron=*/1+*+*+*+* // 每分钟执行一次（离线检测）
+http://localhost:8787/cdn-cgi/handler/scheduled?cron=0+*+*+*+* // 每小时执行一次（合并任务）
+http://localhost:8787/cdn-cgi/handler/scheduled?cron=*+*+1+*+* // 每月一号执行一次（测试使用）
+http://localhost:8787/cdn-cgi/handler/scheduled?cron=*+*+8+*+* // 每月8号执行一次（测试使用）
+http://localhost:8787/cdn-cgi/handler/scheduled?cron=0+12+*+*+* // 每天12点执行一次（测试使用）
 ```
 
 ### 本地测试数据
