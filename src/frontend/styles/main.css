@@ -905,6 +905,19 @@ body::before {
     color: var(--accent-blue);
 }
 
+.stat-time-row {
+    margin-top: -1px;
+    margin-bottom: 0;
+}
+
+.stat-time-value {
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1;
+}
+
 /* --------------------------------------------------------------------------
    14. Ping Panel
    -------------------------------------------------------------------------- */
@@ -1238,6 +1251,17 @@ body::before {
     border-radius: 4px;
     margin-bottom: 16px;
     font-size: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.alert-stack {
+    align-items: flex-start;
+    flex-direction: column;
+}
+
+.alert-line {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -1919,6 +1943,55 @@ body::before {
     background: var(--border-active);
 }
 
+
+/* --------------------------------------------------------------------------
+   36. Remote Mode Disabled Styles
+   -------------------------------------------------------------------------- */
+.remote-mode-disabled {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: var(--bg-primary);
+    z-index: 9999;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+}
+
+.disabled-container {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-active);
+    border-radius: 6px;
+    padding: 40px;
+    max-width: 480px;
+    text-align: center;
+    animation: fadeIn 0.3s ease;
+}
+
+.disabled-icon {
+    font-size: 48px;
+    margin-bottom: 16px;
+    opacity: 0.8;
+}
+
+.disabled-title {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--accent-red);
+    margin-bottom: 12px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.disabled-desc {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.6;
+    margin-bottom: 24px;
+}
 
 /* --------------------------------------------------------------------------
    37. Admin Login Styles

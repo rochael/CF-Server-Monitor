@@ -19,7 +19,7 @@ step() { echo -e "${BLUE}[→]${NC} $1"; }
 
 SERVER_ID="${1:-550e8400-e29b-41d4-a716-446655440001}"
 SECRET="${2:-123456}"
-WORKER_URL="${3:-http://localhost:8787/update}"
+WORKER_URL="${3:-https://localhost:8787/update}"
 REPORT_INTERVAL="${4:-10}"
 
 generate_random() {
@@ -122,7 +122,7 @@ while true; do
 EOF
 )
     
-    RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" -d "$PAYLOAD" -m 5 --connect-timeout 2 "$WORKER_URL" 2>/dev/null || echo "000")
+    RESPONSE=$(curl -s -k -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" -d "$PAYLOAD" -m 5 --connect-timeout 2 "$WORKER_URL" 2>/dev/null || echo "000")
     
     if [ "$RESPONSE" = "200" ] || [ "$RESPONSE" = "201" ]; then
         info "[$(date '+%Y-%m-%d %H:%M:%S')] 数据上报成功 - CPU: ${CPU}% | GPU: ${GPU}% | Loss CT: ${LOSS_CT}% | RAM: ${RAM}% | Disk: ${DISK}%"

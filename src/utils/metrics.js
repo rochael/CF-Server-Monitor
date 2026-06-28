@@ -2,8 +2,6 @@ export function mergeMetricsIntoServer(server, metrics) {
   if (!metrics) return;
 
   server.cpu = metrics.cpu || 0;
-  server.ram = metrics.ram || 0;
-  server.disk = metrics.disk || 0;
   server.load_avg = metrics.load ?? metrics.load_avg ?? '0 0 0';
   server.net_in_speed = metrics.net_in_speed || 0;
   server.net_out_speed = metrics.net_out_speed || 0;
@@ -34,7 +32,7 @@ export function mergeMetricsIntoServer(server, metrics) {
   server.gpu_info = metrics.gpu_info || '';
   server.arch = metrics.arch || '';
   server.os = metrics.os || '';
-  server.country = metrics.country || '';
+  server.region = metrics.region || '';
   server.ip_v4 = metrics.ip_v4 || '0';
   server.ip_v6 = metrics.ip_v6 || '0';
   server.boot_time = metrics.boot_time || '';

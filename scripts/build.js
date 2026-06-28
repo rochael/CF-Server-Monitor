@@ -2,13 +2,20 @@
 import { execSync } from 'child_process';
 import fs from 'fs-extra';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
-const __dirname = path.dirname(new URL(import.meta.url).pathname);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
 const publicDir = path.join(rootDir, 'public');
 const distDir = path.join(rootDir, 'dist');
 
 console.log('Cleaning dist directory...');
+let existingConfigJson = null;
+const distConfigPath = path.join(distDir, 'config.json');
+if (fs.existsSync(distConfigPath)) {
+  existingConfigJson = fs.readFileSync(distConfigPath, 'utf8');
+  console.log('Preserved existing config.json from dist');
+}
 if (fs.existsSync(distDir)) {
   fs.removeSync(distDir);
 }
@@ -18,8 +25,13 @@ execSync('npx vite build', { cwd: rootDir, stdio: 'inherit' });
 
 console.log('Copying static assets...');
 if (fs.existsSync(publicDir)) {
-  fs.copySync(publicDir, distDir);
+  fs.copySync(publicDir, distDir, { overwrite: false });
   console.log('Copied all static assets');
+}
+
+if (existingConfigJson && !fs.existsSync(distConfigPath)) {
+  fs.writeFileSync(distConfigPath, existingConfigJson, 'utf8');
+  console.log('Restored existing config.json');
 }
 
 // 替换时间戳

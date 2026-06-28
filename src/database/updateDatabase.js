@@ -15,6 +15,8 @@ export async function updateDatabase(db) {
     const historyCols = await addHistoryColumns(db);
     results.push({ name: 'metrics_history 表列更新', ...historyCols });
 
+    // 无需清理metrics_history多余字段，消耗过大，不影响使用，每月执行monthlyCleanup的时候会自动清理
+
     const historyRowid = await optimizeMetricsHistoryRowid(db);
     results.push({ name: 'metrics_history 写入优化', ...historyRowid });
     
@@ -28,14 +30,14 @@ export async function updateDatabase(db) {
     
     return {
       success: true,
-      message: '数据库更新成功',
+      message: 'databaseUpgradeSuccess',
       results
     };
   } catch (e) {
     console.error('❌ 数据库更新失败:', e);
     return {
       success: false,
-      message: '数据库更新失败',
+      message: 'databaseUpgradeFailed',
       error: e.message,
       results
     };
@@ -72,7 +74,7 @@ async function migrateLoadToLoadAvg(db) {
   }
 }
 
-async function addServerColumns(db) {
+export async function addServerColumns(db) {
   try {
     const { results: columns } = await db.prepare(`PRAGMA table_info(servers)`).all();
     const existingCols = columns.map(c => c.name);
@@ -81,6 +83,7 @@ async function addServerColumns(db) {
       is_hidden: "TEXT DEFAULT '0'",
       sort_order: "INTEGER DEFAULT 0",
       reset_day: "INTEGER DEFAULT 1",
+      collect_interval: "INTEGER DEFAULT 0",
       report_interval: "INTEGER DEFAULT 60",
       ping_mode: "TEXT DEFAULT 'http'",
       traffic_calc_type: "TEXT DEFAULT 'total'"
@@ -125,7 +128,7 @@ async function cleanupServerExtraColumns(db) {
   }
 }
 
-async function addHistoryColumns(db) {
+export async function addHistoryColumns(db) {
   try {
     const { results: historyColumns } = await db.prepare(`PRAGMA table_info(metrics_history)`).all();
     const existingHistoryCols = historyColumns.map(c => c.name);
@@ -137,7 +140,7 @@ async function addHistoryColumns(db) {
       gpu_info: "TEXT DEFAULT ''",
       arch: "TEXT DEFAULT ''",
       os: "TEXT DEFAULT ''",
-      country: "TEXT DEFAULT ''",
+      region: "TEXT DEFAULT ''",
       ip_v4: "TEXT DEFAULT '0'",
       ip_v6: "TEXT DEFAULT '0'",
       boot_time: "TEXT DEFAULT ''",
@@ -197,8 +200,6 @@ async function optimizeMetricsHistoryRowid(db) {
         server_id TEXT NOT NULL,
         timestamp INTEGER DEFAULT 0,
         cpu REAL DEFAULT 0,
-        ram REAL DEFAULT 0,
-        disk REAL DEFAULT 0,
         load_avg TEXT DEFAULT '0',
         net_in_speed REAL DEFAULT 0,
         net_out_speed REAL DEFAULT 0,
@@ -227,7 +228,7 @@ async function optimizeMetricsHistoryRowid(db) {
         gpu_info TEXT DEFAULT '',
         arch TEXT DEFAULT '',
         os TEXT DEFAULT '',
-        country TEXT DEFAULT '',
+        region TEXT DEFAULT '',
         ip_v4 TEXT DEFAULT '0',
         ip_v6 TEXT DEFAULT '0',
         boot_time TEXT DEFAULT '',
@@ -245,25 +246,25 @@ async function optimizeMetricsHistoryRowid(db) {
 
     await db.prepare(`
       INSERT INTO metrics_history_new (
-        id, server_id, timestamp, cpu, ram, disk, load_avg,
+        id, server_id, timestamp, cpu, load_avg,
         net_in_speed, net_out_speed, net_rx, net_tx,
         processes, tcp_conn, udp_conn,
         ping_ct, ping_cu, ping_cm, ping_bd,
         loss_ct, loss_cu, loss_cm, loss_bd,
         ram_total, ram_used, swap_total, swap_used,
         disk_total, disk_used,
-        cpu_cores, cpu_info, gpu, gpu_info, arch, os, country, ip_v4, ip_v6, boot_time,
-        net_rx_monthly, net_tx_monthly
-      )
-      SELECT
-        id, server_id, timestamp, cpu, ram, disk, load_avg,
-        net_in_speed, net_out_speed, net_rx, net_tx,
-        processes, tcp_conn, udp_conn,
-        ping_ct, ping_cu, ping_cm, ping_bd,
-        ${historySelectExpr('loss_ct', 'NULL')}, ${historySelectExpr('loss_cu', 'NULL')}, ${historySelectExpr('loss_cm', 'NULL')}, ${historySelectExpr('loss_bd', 'NULL')},
-        ram_total, ram_used, swap_total, swap_used,
-        disk_total, disk_used,
-        cpu_cores, cpu_info, ${historySelectExpr('gpu', 'NULL')}, ${historySelectExpr('gpu_info', "''")}, arch, os, country, ip_v4, ip_v6, boot_time,
+        cpu_cores, cpu_info, gpu, gpu_info, arch, os, region, ip_v4, ip_v6, boot_time,
+      net_rx_monthly, net_tx_monthly
+    )
+    SELECT
+      id, server_id, timestamp, cpu, load_avg,
+      net_in_speed, net_out_speed, net_rx, net_tx,
+      processes, tcp_conn, udp_conn,
+      ping_ct, ping_cu, ping_cm, ping_bd,
+      ${historySelectExpr('loss_ct', 'NULL')}, ${historySelectExpr('loss_cu', 'NULL')}, ${historySelectExpr('loss_cm', 'NULL')}, ${historySelectExpr('loss_bd', 'NULL')},
+      ram_total, ram_used, swap_total, swap_used,
+      disk_total, disk_used,
+      cpu_cores, cpu_info, ${historySelectExpr('gpu', 'NULL')}, ${historySelectExpr('gpu_info', "''")}, arch, os, ${historySelectExpr('region', "''")}, ip_v4, ip_v6, boot_time,
         ${historySelectExpr('net_rx_monthly', '0')}, ${historySelectExpr('net_tx_monthly', '0')}
       FROM metrics_history
     `).run();
@@ -326,6 +327,7 @@ export async function cleanupStaleSettings(db) {
       'show_expire',
       'show_bw',
       'show_tf',
+      'show_time',
       'show_long_history',
       'tg_notify',
       'tg_bot_token',

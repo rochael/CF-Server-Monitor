@@ -29,12 +29,10 @@ function generateMetrics(baseTimestamp, serverIdx, hourOffset) {
   
   return {
     cpu: cpu.toFixed(2),
-    ram: ram.toFixed(2),
     ram_total: ramTotal.toString(),
     ram_used: Math.floor(ramUsed).toString(),
     swap_total: '8192',
     swap_used: Math.floor(Math.random() * 512).toString(),
-    disk: (45 + (Math.random() - 0.5) * 5).toFixed(0),
     disk_total: (serverIdx === 0 ? 200 : 100).toString(),
     disk_used: '90',
     load_avg: `${(baseline.load_avg + (Math.random() - 0.5) * 0.8).toFixed(2)} ${(baseline.load_avg + (Math.random() - 0.5) * 0.6).toFixed(2)} ${(baseline.load_avg + (Math.random() - 0.5) * 0.4).toFixed(2)}`,
@@ -63,8 +61,8 @@ function generateMetrics(baseTimestamp, serverIdx, hourOffset) {
     gpu_info: serverIdx === 0 ? 'NVIDIA Tesla T4' : 'AMD Radeon Pro V620',
     arch: 'x86_64',
     os: serverIdx === 0 ? 'Ubuntu 22.04 LTS' : 'Debian 12',
-    country: serverIdx === 0 ? 'US' : 'JP',
-    boot_time: (Date.now() - (serverIdx === 0 ? 86400000 * 600 : 86400000 * 15)).toString()
+    boot_time: (Date.now() - (serverIdx === 0 ? 86400000 * 600 : 86400000 * 15)).toString(),
+    region: serverIdx === 0 ? 'US' : 'JP',
   };
 }
 
@@ -120,6 +118,7 @@ const siteOptions = {
   show_expire: 'true',
   show_bw: 'true',
   show_tf: 'true',
+  show_time: 'true',
   tg_notify: 'false',
   tg_bot_token: '',
   tg_chat_id: '',
@@ -197,22 +196,21 @@ for (let s = 0; s < servers.length; s++) {
 
     rows.push(`
 INSERT INTO metrics_history (
-  server_id, timestamp, cpu, ram, disk, load_avg,
+  server_id, timestamp, cpu, load_avg,
   net_in_speed, net_out_speed, net_rx, net_tx,
   processes, tcp_conn, udp_conn,
   ping_ct, ping_cu, ping_cm, ping_bd,
   loss_ct, loss_cu, loss_cm, loss_bd,
   ram_total, ram_used, swap_total, swap_used,
   disk_total, disk_used,
-  cpu_cores, cpu_info, gpu, gpu_info, arch, os, country,
+  cpu_cores, cpu_info, gpu, gpu_info, arch, os,
   ip_v4, ip_v6, boot_time,
-  net_rx_monthly, net_tx_monthly
+  net_rx_monthly, net_tx_monthly,
+  region
 ) VALUES (
   '${server.id}',
   ${ts},
   ${parseFloat(metrics.cpu)},
-  ${parseFloat(metrics.ram)},
-  ${parseFloat(metrics.disk)},
   '${metrics.load_avg}',
   ${parseFloat(metrics.net_in_speed)},
   ${parseFloat(metrics.net_out_speed)},
@@ -241,12 +239,12 @@ INSERT INTO metrics_history (
   '${metrics.gpu_info}',
   '${metrics.arch}',
   '${metrics.os}',
-  '${metrics.country}',
   '${metrics.ip_v4}',
   '${metrics.ip_v6}',
   '${metrics.boot_time}',
   ${parseFloat(metrics.net_rx_monthly)},
-  ${parseFloat(metrics.net_tx_monthly)}
+  ${parseFloat(metrics.net_tx_monthly)},
+  '${metrics.region}'
 );
 `);
 

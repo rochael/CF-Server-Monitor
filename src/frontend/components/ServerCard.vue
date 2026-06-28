@@ -1,10 +1,10 @@
 <template>
-  <a :href="'/server/' + server.id" class="server-card" :data-country="countryCode">
+  <router-link :to="to" class="server-card" :data-region="regionCode">
     <div class="server-card-header">
       <div class="server-identity">
         <div class="status-indicator" :style="{ background: statusColor, boxShadow: '0 0 8px ' + statusColor }"></div>
-        <span v-if="countryCode !== 'xx'">
-          <img :src="'https://flagcdn.com/24x18/' + countryCode + '.png'" :alt="countryCode" style="vertical-align: middle; margin-right: 5px; border-radius: 2px; filter: brightness(0.9);">
+        <span v-if="regionCode !== 'xx'">
+          <img :src="'https://flagcdn.com/24x18/' + regionCode + '.png'" :alt="regionCode" style="vertical-align: middle; margin-right: 5px; border-radius: 2px; filter: brightness(0.9);">
         </span>
         <span v-else>🏳️</span>
         <span class="server-name">{{ server.name }}</span>
@@ -62,6 +62,10 @@
         <span class="net-down">▼ {{ totalRx }}</span>
         <span class="net-up">▲ {{ totalTx }}</span>
       </div>
+      <div v-if="sysConfig.show_time" class="stat-row stat-time-row">
+        <span class="stat-key">TIME</span>
+        <span class="stat-time-value">{{ dataTimeText }}</span>
+      </div>
     </div>
     <div class="ping-panel">
       <div class="ping-item">
@@ -81,12 +85,12 @@
         <span class="ping-value" :style="{ color: getPingColor(server.ping_bd) }">{{ !isPingValid(server.ping_bd) ? trans.timeout : server.ping_bd + 'ms' }}</span>
       </div>
     </div>
-  </a>
+  </router-link>
 </template>
 
 <script setup>
 import { computed } from 'vue'
-import { formatBytes, getFlagCountryCode } from '../utils/api'
+import { formatBytes, getFlagRegionCode } from '../utils/api'
 import { t, currentLang } from '../utils/i18n'
 import { translations } from '../utils/i18n'
 import { TIME, PING } from '../utils/constants'
@@ -102,27 +106,44 @@ const props = defineProps({
       show_price: true,
       show_expire: true,
       show_bw: true,
-      show_tf: true
+      show_tf: true,
+      show_time: true
     })
+  },
+  to: {
+    type: String,
+    default: ''
   }
 })
 
 const trans = computed(() => translations[currentLang.value] || translations.en)
 
-const now = Date.now()
+const currentTime = computed(() => {
+  const ts = Number(props.server.current_timestamp)
+  if (Number.isFinite(ts) && ts > 0) {
+    return ts < 10000000000 ? ts * 1000 : ts
+  }
+  return Date.now()
+})
 
-const countryCode = computed(() => getFlagCountryCode(props.server.country))
+const regionCode = computed(() => getFlagRegionCode(props.server.region))
 
 const isOnline = computed(() => {
-  const lastUpdated = new Date(props.server.last_updated).getTime()
-  return (now - lastUpdated) < TIME.ONLINE_THRESHOLD_MS
+  const lastUpdated = normalizeTimestamp(props.server.report_timestamp ?? props.server.last_updated)
+  if (!lastUpdated) return false
+  return (currentTime.value - lastUpdated) < TIME.ONLINE_THRESHOLD_MS
 })
 
 const statusColor = computed(() => isOnline.value ? 'var(--accent-green)' : 'var(--accent-red)')
 const statusText = computed(() => isOnline.value ? trans.value.online : trans.value.offline)
 
 const cpuPercent = computed(() => parseFloat(props.server.cpu || 0).toFixed(1))
-const ramPercent = computed(() => parseFloat(props.server.ram || 0).toFixed(1))
+const ramPercent = computed(() => {
+  if (props.server.ram_total > 0) {
+    return ((props.server.ram_used / props.server.ram_total) * 100).toFixed(2)
+  }
+  return '0.00'
+})
 const diskPercent = computed(() => {
   if (props.server.disk_total > 0) {
     return ((props.server.disk_used / props.server.disk_total) * 100).toFixed(2)
@@ -155,15 +176,48 @@ const netOutSpeed = computed(() => formatBytes(props.server.net_out_speed))
 const totalRx = computed(() => formatBytes(props.server.net_rx))
 const totalTx = computed(() => formatBytes(props.server.net_tx))
 
+const normalizeTimestamp = (value) => {
+  if (value === null || value === undefined || value === '') return null
+  const numeric = Number(value)
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return numeric < 10000000000 ? numeric * 1000 : numeric
+  }
+  const parsed = new Date(value).getTime()
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null
+}
+
+const formatDateTime = (timestamp) => {
+  if (!timestamp) return '-'
+  const date = new Date(timestamp)
+  const pad = (num) => String(num).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+const dataTimeText = computed(() => {
+  const reportTimestamp = normalizeTimestamp(props.server.report_timestamp ?? props.server.last_updated)
+  if (!isOnline.value) return formatDateTime(reportTimestamp)
+
+  const displayTimestamp = normalizeTimestamp(
+    props.server.display_timestamp ?? props.server.sample_timestamp ?? props.server.timestamp ?? reportTimestamp
+  )
+  const sampleTimestamp = normalizeTimestamp(
+    props.server.sample_timestamp ?? props.server.timestamp ?? displayTimestamp
+  )
+  const lagSeconds = displayTimestamp && sampleTimestamp
+    ? Math.max(0, Math.floor((displayTimestamp - sampleTimestamp) / 1000))
+    : 0
+  return `${formatDateTime(sampleTimestamp)}${lagSeconds > 0 ? ` (+${lagSeconds}s)` : ''}`
+})
+
 const isExpired = computed(() => {
   const expTime = new Date(props.server.expire_date).getTime()
-  return !isNaN(expTime) && expTime < now
+  return !isNaN(expTime) && expTime < currentTime.value
 })
 
 const expireText = computed(() => {
   const expTime = new Date(props.server.expire_date).getTime()
   if (isNaN(expTime)) return ''
-  const diff = expTime - now
+  const diff = expTime - currentTime.value
   const days = Math.ceil(diff / (1000 * 3600 * 24))
   return days > 0 ? `${days}${trans.value.expireDays}` : trans.value.expired
 })

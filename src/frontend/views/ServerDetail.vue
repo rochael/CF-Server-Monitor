@@ -3,12 +3,12 @@
     <TerminalHeader :title="server.name || 'Loading...'" />
     
     <div class="nav-bar">
-      <a href="/" class="back-btn">
+      <router-link to="/" class="back-btn">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <polyline points="15 18 9 12 15 6"></polyline>
         </svg>
         {{ trans.back }}
-      </a>
+      </router-link>
       <div class="time-selector" v-show="historyLoaded" id="time-selector">
         <button 
           v-for="option in timeOptions" 
@@ -24,9 +24,9 @@
       <div class="host-card-header">
         <div class="host-name">
           <span class="prompt">root@</span>
-          <span v-if="server.country && server.country !== 'xx'">
-            <img :src="'https://flagcdn.com/24x18/' + getFlagCountryCode(server.country) + '.png'" :alt="server.country" class="flag-img" style="margin-right:6px;">
-          </span>
+          <span v-if="server.region && server.region !== 'xx'">
+          <img :src="'https://flagcdn.com/24x18/' + getFlagRegionCode(server.region) + '.png'" :alt="server.region" class="flag-img" style="margin-right:6px;">
+        </span>
           <span v-else>🏳️</span>
           <span>{{ server.name || 'Loading...' }}</span>
           <span style="color: var(--text-muted);">:~#</span>
@@ -276,17 +276,18 @@
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import TerminalHeader from '../components/TerminalHeader.vue'
 import Footer from '../components/Footer.vue'
-import { fetchServerDetail, fetchAllHistory, formatBytes, isAdminLoggedIn, createLiveSocket, getFlagCountryCode } from '../utils/api.js'
+import { fetchServerDetail, fetchAllHistory, formatBytes, isAdminLoggedIn, createLiveSocket, getFlagRegionCode, getApiBases } from '../utils/api.js'
 import Chart from 'chart.js/auto'
 import 'chartjs-adapter-date-fns'
-import { currentLang, translations } from '../utils/i18n'
+import { t, currentLang, translations } from '../utils/i18n'
 import { TIME, CHART, GAP_BREAK } from '../utils/constants'
 import useTheme from '../composables/useTheme'
 
 const route = useRoute()
+const router = useRouter()
 
 let serverId = route.params.id
 if (!serverId) {
@@ -295,7 +296,13 @@ if (!serverId) {
 }
 
 if (!serverId) {
-  window.location.href = '/'
+  router.push('/')
+}
+
+const apiIndex = ref(0)
+const indexParam = route.query.apiIndex
+if (indexParam !== undefined && indexParam !== null && !isNaN(parseInt(indexParam))) {
+  apiIndex.value = parseInt(indexParam)
 }
 
 const server = ref({})
@@ -334,7 +341,12 @@ const isOnline = computed(() => {
 
 const cpuPercent = computed(() => (parseFloat(server.value.cpu) || 0).toFixed(1))
 const gpuPercent = computed(() => (parseFloat(server.value.gpu) || 0).toFixed(1))
-const ramPercent = computed(() => (parseFloat(server.value.ram) || 0).toFixed(1))
+const ramPercent = computed(() => {
+  if (server.value.ram_total > 0) {
+    return ((server.value.ram_used / server.value.ram_total) * 100).toFixed(2)
+  }
+  return '0.00'
+})
 const diskPercent = computed(() => {
   if (server.value.disk_total > 0) {
     return ((server.value.disk_used / server.value.disk_total) * 100).toFixed(2)
@@ -820,6 +832,39 @@ const updateChartDatasetWithSwap = (chart, datasetIndex, dataPoints) => {
   chart.update('none')
 }
 
+const updateChartDatasetWithRam = (chart, datasetIndex, dataPoints) => {
+  if (!chart) return
+
+  const dataset = chart.data.datasets[datasetIndex]
+  if (!dataset) return
+
+  const endTime = Date.now()
+  const startTime = endTime - currentHours.value * 60 * 60 * 1000
+
+  let processedData = []
+  if (dataPoints && dataPoints.length > 0) {
+    const sampledData = sampleData(dataPoints)
+
+    processedData = sampledData.map(d => {
+      const ramTotal = parseFloat(d.ram_total) || 0
+      const ramUsed = parseFloat(d.ram_used) || 0
+      const percent = ramTotal === 0 ? 0 : (ramUsed / ramTotal) * 100
+      return { x: new Date(d.timestamp).getTime(), y: percent }
+    })
+
+    processedData.sort((a, b) => a.x - b.x)
+    processedData = applyGapBreak(processedData)
+  }
+
+  if (chart.options && chart.options.scales && chart.options.scales.x) {
+    chart.options.scales.x.min = startTime
+    chart.options.scales.x.max = endTime
+  }
+
+  dataset.data = processedData
+  chart.update('none')
+}
+
 const updateChartDatasetWithDisk = (chart, datasetIndex, dataPoints) => {
   if (!chart) return
 
@@ -894,14 +939,14 @@ const updateLoadChart = (chart, dataPoints) => {
 
 const loadAllHistory = async (hours) => {
   try {
-    const res = await fetchAllHistory(serverId, hours)
+    const res = await fetchAllHistory(serverId, hours, apiIndex.value)
     if (!res) return
     const allData = res
     hasLossHistoryData.value = allData.some(item => ['loss_ct', 'loss_cu', 'loss_cm', 'loss_bd'].some(key => isLossValid(item[key])))
 
     updateChartDataset(charts.cpu, 0, allData, 'timestamp', 'cpu')
     updateChartDataset(charts.gpu, 0, allData, 'timestamp', 'gpu', true)
-    updateChartDataset(charts.ram, 0, allData, 'timestamp', 'ram')
+    updateChartDatasetWithRam(charts.ram, 0, allData)
     updateChartDatasetWithSwap(charts.ram, 1, allData)
     updateChartDatasetWithDisk(charts.disk, 0, allData)
     updateChartDataset(charts.proc, 0, allData, 'timestamp', 'processes')
@@ -931,10 +976,10 @@ const loadAllHistory = async (hours) => {
       })
     })
   } catch (e) {
-    if (e && e.code === 'DATABASE_UPGRADE_REQUIRED') {
+    if (e && e.message === 'databaseUpgradeRequired') {
       if (!databaseUpgradeAlertShown) {
         databaseUpgradeAlertShown = true
-        alert(trans.value.databaseUpgradeRequired || e.message || 'Database schema is not upgraded. Please upgrade database in Admin Panel.')
+        alert(t(e.message))
       }
       return
     }
@@ -998,13 +1043,13 @@ const appendDataToChart = (chart, datasetIndex, timestamp, value, isPing = false
   chart.update('none')
 }
 
-const STATIC_FIELDS = ['id', 'name', 'country', 'arch', 'os', 'cpu_info', 'cpu_cores', 'gpu_info', 'ram_total', 'disk_total', 'expire_date', 'server_group', 'traffic_limit', 'net_rx_monthly', 'net_tx_monthly']
+const STATIC_FIELDS = ['id', 'name', 'region', 'arch', 'os', 'cpu_info', 'cpu_cores', 'gpu_info', 'expire_date', 'server_group', 'traffic_limit', 'net_rx_monthly', 'net_tx_monthly', 'boot_time', 'timestamp', 'ip_v4', 'ip_v6']
 
 const fetchCurrentStatus = async (incomingData) => {
   try {
     let data = incomingData
     if (!data) {
-      data = await fetchServerDetail(serverId)
+      data = await fetchServerDetail(serverId, apiIndex.value)
       if (!data) return
     }
     if (!data || !data.last_updated) return
@@ -1026,7 +1071,8 @@ const fetchCurrentStatus = async (incomingData) => {
     const dataTimestamp = new Date(data.last_updated).getTime()
     appendDataToChart(charts.cpu, 0, dataTimestamp, data.cpu)
     appendDataToChart(charts.gpu, 0, dataTimestamp, data.gpu)
-    appendDataToChart(charts.ram, 0, dataTimestamp, data.ram)
+    const ramPercent = (parseFloat(data.ram_total) > 0) ? (parseFloat(data.ram_used) / parseFloat(data.ram_total)) * 100 : 0
+    appendDataToChart(charts.ram, 0, dataTimestamp, ramPercent)
     const swapPercent = (parseFloat(data.swap_total) > 0) ? (parseFloat(data.swap_used) / parseFloat(data.swap_total)) * 100 : 0
     appendDataToChart(charts.ram, 1, dataTimestamp, swapPercent)
     const diskPercent = (parseFloat(data.disk_total) > 0) ? (parseFloat(data.disk_used) / parseFloat(data.disk_total)) * 100 : 0
@@ -1089,7 +1135,7 @@ const setTimeRange = (hours) => {
 
 const goToLogin = () => {
   showLoginModal.value = false
-  window.location.href = '/admin'
+  router.push('/admin')
 }
 
 let statusTimer = null
@@ -1138,7 +1184,7 @@ const init = async () => {
         statusTimer = setInterval(() => fetchCurrentStatus(), TIME.POLL_INTERVAL_MS)
       }
     }
-  })
+  }, apiIndex.value)
 }
 
 watch([cpuChartRef, gpuChartRef, ramChartRef, diskChartRef, netChartRef, procChartRef, connChartRef, pingChartRef, lossChartRef, loadChartRef], () => {

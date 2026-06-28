@@ -61,12 +61,13 @@ print_usage() {
     echo ""
     echo "可选参数:"
     echo "  -interval=N    上报间隔(秒)，默认60"
+    echo "  -collect_interval=N    采样间隔(秒)，默认0"
     echo "  -ping=TYPE     探测类型: http | tcp，默认http"
     echo "  -ct=HOST       自定义CT测试节点"
     echo "  -cu=HOST       自定义CU测试节点"
     echo "  -cm=HOST       自定义CM测试节点"
     echo "  -bd=HOST       自定义BD测试节点"
-    echo "  -reset_day=N   流量重置日(1-31)，默认1"
+    echo "  -reset_day=N   流量重置日(1-31, 0=不重置)，默认1"
     echo "  -rx_correction=N  下行流量校正(GB)，修改当月下行数据"
     echo "  -tx_correction=N  上行流量校正(GB)，修改当月上行数据"
     echo ""
@@ -269,17 +270,19 @@ extract_old_params() {
             OLD_RESET_DAY=$(printf '%s' "$OLD_RESET_DAY" | sed 's/^"//; s/"$//' | sed "s/^'//; s/'$//")
 
             # 调试输出（可选）
-            echo "提取的参数:"
-            echo "  SERVER_ID: '$OLD_SERVER_ID'"
-            echo "  SECRET: '$OLD_SECRET'"
-            echo "  WORKER_URL: '$OLD_WORKER_URL'"
-            echo "  INTERVAL: '$OLD_REPORT_INTERVAL'"
-            echo "  PING_TYPE: '$OLD_PING_TYPE'"
-            [ -n "$OLD_CT_NODE" ] && echo "  CT: '$OLD_CT_NODE'"
-            [ -n "$OLD_CU_NODE" ] && echo "  CU: '$OLD_CU_NODE'"
-            [ -n "$OLD_CM_NODE" ] && echo "  CM: '$OLD_CM_NODE'"
-            [ -n "$OLD_BD_NODE" ] && echo "  BD: '$OLD_BD_NODE'"
-            [ -n "$OLD_RESET_DAY" ] && echo "  RESET_DAY: '$OLD_RESET_DAY'"
+            if [ -n "${OLD_SERVER_ID}" ]; then
+                echo "提取的参数:"
+                echo "  SERVER_ID: '$OLD_SERVER_ID'"
+                echo "  SECRET: '$OLD_SECRET'"
+                echo "  WORKER_URL: '$OLD_WORKER_URL'"
+                echo "  INTERVAL: '$OLD_REPORT_INTERVAL'"
+                echo "  PING_TYPE: '$OLD_PING_TYPE'"
+                [ -n "$OLD_CT_NODE" ] && echo "  CT: '$OLD_CT_NODE'"
+                [ -n "$OLD_CU_NODE" ] && echo "  CU: '$OLD_CU_NODE'"
+                [ -n "$OLD_CM_NODE" ] && echo "  CM: '$OLD_CM_NODE'"
+                [ -n "$OLD_BD_NODE" ] && echo "  BD: '$OLD_BD_NODE'"
+                [ -n "$OLD_RESET_DAY" ] && echo "  RESET_DAY: '$OLD_RESET_DAY'"
+            fi
 
             if [ -n "${OLD_SERVER_ID}" ] && [ -n "${OLD_SECRET}" ] && [ -n "${OLD_WORKER_URL}" ]; then
                 info "已从旧版本服务文件提取参数"
@@ -357,6 +360,7 @@ fi
 SERVER_ID=""
 SECRET=""
 WORKER_URL=""
+COLLECT_INTERVAL=""
 REPORT_INTERVAL=""
 PING_TYPE=""
 CT_NODE=""
@@ -370,6 +374,7 @@ while IFS='=' read -r key value; do
         SERVER_ID) SERVER_ID="${value%\"}"; SERVER_ID="${SERVER_ID#\"}" ;;
         SECRET) SECRET="${value%\"}"; SECRET="${SECRET#\"}" ;;
         WORKER_URL) WORKER_URL="${value%\"}"; WORKER_URL="${WORKER_URL#\"}" ;;
+        COLLECT_INTERVAL) COLLECT_INTERVAL="${value%\"}"; COLLECT_INTERVAL="${COLLECT_INTERVAL#\"}" ;;
         REPORT_INTERVAL) REPORT_INTERVAL="${value%\"}"; REPORT_INTERVAL="${REPORT_INTERVAL#\"}" ;;
         PING_TYPE) PING_TYPE="${value%\"}"; PING_TYPE="${PING_TYPE#\"}" ;;
         CT_NODE) CT_NODE="${value%\"}"; CT_NODE="${CT_NODE#\"}" ;;
@@ -380,9 +385,18 @@ while IFS='=' read -r key value; do
     esac
 done < "${CONFIG_FILE}"
 
+COLLECT_INTERVAL=${COLLECT_INTERVAL:-0}
 REPORT_INTERVAL=${REPORT_INTERVAL:-60}
 PING_TYPE=${PING_TYPE:-http}
-RESET_DAY=${RESET_DAY:-1}
+[ -z "$RESET_DAY" ] && RESET_DAY=1
+case "$COLLECT_INTERVAL" in ''|*[!0-9]*) COLLECT_INTERVAL=0 ;; esac
+case "$REPORT_INTERVAL" in ''|*[!0-9]*) REPORT_INTERVAL=60 ;; esac
+[ "$REPORT_INTERVAL" -lt 1 ] && REPORT_INTERVAL=60
+if [ "$COLLECT_INTERVAL" -gt 0 ] && [ "$REPORT_INTERVAL" -lt "$COLLECT_INTERVAL" ]; then
+    REPORT_INTERVAL="$COLLECT_INTERVAL"
+fi
+ACTIVE_INTERVAL="$REPORT_INTERVAL"
+[ "$COLLECT_INTERVAL" -gt 0 ] && ACTIVE_INTERVAL="$COLLECT_INTERVAL"
 
 SHM_DIR="/tmp"
 
@@ -408,6 +422,7 @@ is_leap_year() {
 
 get_period_start_ts() {
     reset_day="$1"
+    [ "$reset_day" -eq 0 ] 2>/dev/null && { echo "0"; return; }
     now_ts="$2"
 
     # 只用 epoch 秒
@@ -491,7 +506,7 @@ calc_monthly_traffic() {
             tx_delta=$((current_tx - saved_tx_prev))
         fi
 
-        if [ "$period_start_ts" -ne "$saved_period_start" ] && [ "$saved_period_start" -ne 0 ]; then
+        if [ "$period_start_ts" -ne 0 ] && [ "$period_start_ts" -ne "$saved_period_start" ] && [ "$saved_period_start" -ne 0 ]; then
             saved_rx_period="$rx_delta"; saved_tx_period="$tx_delta"
         else
             saved_rx_period=$((saved_rx_period + rx_delta))
@@ -607,6 +622,28 @@ CU_NODE="${CU_NODE:-}"
 CM_NODE="${CM_NODE:-}"
 BD_NODE="${BD_NODE:-}"
 
+write_probe_result() {
+    local dest="$1"
+    shift
+    local tmp="${dest}.tmp"
+    if "$@" > "$tmp"; then
+        mv "$tmp" "$dest"
+    else
+        rm -f "$tmp" "$dest"
+    fi
+}
+
+refresh_latency_async() {
+    [ -n "$CT_NODE" ] && write_probe_result /tmp/.cf_ping_ct get_ping "$CT_NODE" &
+    [ -n "$CU_NODE" ] && write_probe_result /tmp/.cf_ping_cu get_ping "$CU_NODE" &
+    [ -n "$CM_NODE" ] && write_probe_result /tmp/.cf_ping_cm get_ping "$CM_NODE" &
+    [ -n "$BD_NODE" ] && write_probe_result /tmp/.cf_ping_bd get_ping "$BD_NODE" &
+    [ -n "$CT_NODE" ] && write_probe_result /tmp/.cf_loss_ct get_packet_loss "$CT_NODE" &
+    [ -n "$CU_NODE" ] && write_probe_result /tmp/.cf_loss_cu get_packet_loss "$CU_NODE" &
+    [ -n "$CM_NODE" ] && write_probe_result /tmp/.cf_loss_cm get_packet_loss "$CM_NODE" &
+    [ -n "$BD_NODE" ] && write_probe_result /tmp/.cf_loss_bd get_packet_loss "$BD_NODE" &
+}
+
 run_network_worker() {
     set -eu
     last_ip=0
@@ -622,14 +659,7 @@ run_network_worker() {
         fi
 
         if [ $((now - last_ping)) -ge 30 ] || [ "$last_ping" -eq 0 ]; then
-            [ -n "$CT_NODE" ] && get_ping "$CT_NODE" > /tmp/.cf_ping_ct.tmp && mv /tmp/.cf_ping_ct.tmp /tmp/.cf_ping_ct || rm -f /tmp/.cf_ping_ct
-            [ -n "$CU_NODE" ] && get_ping "$CU_NODE" > /tmp/.cf_ping_cu.tmp && mv /tmp/.cf_ping_cu.tmp /tmp/.cf_ping_cu || rm -f /tmp/.cf_ping_cu
-            [ -n "$CM_NODE" ] && get_ping "$CM_NODE" > /tmp/.cf_ping_cm.tmp && mv /tmp/.cf_ping_cm.tmp /tmp/.cf_ping_cm || rm -f /tmp/.cf_ping_cm
-            [ -n "$BD_NODE" ] && get_ping "$BD_NODE" > /tmp/.cf_ping_bd.tmp && mv /tmp/.cf_ping_bd.tmp /tmp/.cf_ping_bd || rm -f /tmp/.cf_ping_bd
-            [ -n "$CT_NODE" ] && get_packet_loss "$CT_NODE" > /tmp/.cf_loss_ct.tmp && mv /tmp/.cf_loss_ct.tmp /tmp/.cf_loss_ct || rm -f /tmp/.cf_loss_ct
-            [ -n "$CU_NODE" ] && get_packet_loss "$CU_NODE" > /tmp/.cf_loss_cu.tmp && mv /tmp/.cf_loss_cu.tmp /tmp/.cf_loss_cu || rm -f /tmp/.cf_loss_cu
-            [ -n "$CM_NODE" ] && get_packet_loss "$CM_NODE" > /tmp/.cf_loss_cm.tmp && mv /tmp/.cf_loss_cm.tmp /tmp/.cf_loss_cm || rm -f /tmp/.cf_loss_cm
-            [ -n "$BD_NODE" ] && get_packet_loss "$BD_NODE" > /tmp/.cf_loss_bd.tmp && mv /tmp/.cf_loss_bd.tmp /tmp/.cf_loss_bd || rm -f /tmp/.cf_loss_bd
+            refresh_latency_async
             last_ping="$now"
         fi
         sleep 5
@@ -650,6 +680,9 @@ echo "[INFO] CF-Server-Monitor Probe Engine Started Successfully."
 
 run_network_worker &
 WORKER_PID=$!
+SAMPLES_JSON=""
+SAMPLE_COUNT=0
+LAST_REPORT_TIME=0
 
 while true; do
     LOOP_START_TIME=$(date +%s)
@@ -671,12 +704,6 @@ while true; do
     RAM_USED=$(((MEM_TOTAL_KB - MEM_AVAIL_KB) / 1024))
     [ "${RAM_USED}" -lt 0 ] && RAM_USED=0
 
-    if [ "${RAM_TOTAL}" -gt 0 ]; then
-        RAM=$(awk -v u="${RAM_USED}" -v t="${RAM_TOTAL}" 'BEGIN {printf "%.2f", (u/t)*100}')
-    else
-        RAM="0.00"
-    fi
-
     SWAP_TOTAL_KB=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0); SWAP_TOTAL_KB=${SWAP_TOTAL_KB:-0}
     SWAP_FREE_KB=$(awk '/^SwapFree:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0); SWAP_FREE_KB=${SWAP_FREE_KB:-0}
     SWAP_TOTAL=$((SWAP_TOTAL_KB / 1024))
@@ -684,11 +711,10 @@ while true; do
     [ "${SWAP_USED}" -lt 0 ] && SWAP_USED=0
 
     DISK_INFO=$(df -P / 2>/dev/null | tail -n1 || echo "")
-    DISK_TOTAL=0; DISK_USED=0; DISK=0
+    DISK_TOTAL=0; DISK_USED=0
     if [ -n "${DISK_INFO}" ]; then
         DISK_TOTAL=$(echo "${DISK_INFO}" | awk '{print int($2/1024)}')
         DISK_USED=$(echo "${DISK_INFO}" | awk '{print int($3/1024)}')
-        DISK=$(echo "${DISK_INFO}" | awk '{print $5}' | tr -d '%')
     fi
 
     CPU_STAT=$(get_cpu_stat)
@@ -756,7 +782,7 @@ while true; do
     TX_MONTHLY=$(echo "$MONTHLY_TRAFFIC" | awk '{print $2}')
 
     TIME_DELTA=$((LOOP_START_TIME - PREV_LOOP_TIME))
-    [ "${TIME_DELTA}" -le 0 ] && TIME_DELTA=${REPORT_INTERVAL}
+    [ "${TIME_DELTA}" -le 0 ] && TIME_DELTA=${ACTIVE_INTERVAL}
 
     RX_DELTA=$((RX_NOW - RX_PREV))
     TX_DELTA=$((TX_NOW - TX_PREV))
@@ -785,15 +811,42 @@ while true; do
     EARCH=$(escape_json "${ARCH}")
     ECPU=$(escape_json "${CPU_INFO}")
 
-    PAYLOAD=$(cat <<EOF
-{"id":"$SERVER_ID","secret":"$SECRET","metrics":{"cpu":"$CPU","ram":"$RAM","ram_total":"$RAM_TOTAL","ram_used":"$RAM_USED","swap_total":"$SWAP_TOTAL","swap_used":"$SWAP_USED","disk":"$DISK","disk_total":"$DISK_TOTAL","disk_used":"$DISK_USED","load_avg":"$LOAD_AVG","boot_time":"$BOOT_TIME","net_rx":"$RX_NOW","net_tx":"$TX_NOW","net_rx_monthly":"$RX_MONTHLY","net_tx_monthly":"$TX_MONTHLY","net_in_speed":"$RX_SPEED","net_out_speed":"$TX_SPEED","os":"$EOS","arch":"$EARCH","cpu_info":"$ECPU","cpu_cores":"$CPU_CORES","processes":"$PROCESSES","tcp_conn":"$TCP_CONN","udp_conn":"$UDP_CONN","ip_v4":"$IPV4","ip_v6":"$IPV6","ping_ct":"$PING_CT","ping_cu":"$PING_CU","ping_cm":"$PING_CM","ping_bd":"$PING_BD","loss_ct":"$LOSS_CT","loss_cu":"$LOSS_CU","loss_cm":"$LOSS_CM","loss_bd":"$LOSS_BD"}}
+    METRICS_JSON=$(cat <<EOF
+{"cpu":"$CPU","ram_total":"$RAM_TOTAL","ram_used":"$RAM_USED","swap_total":"$SWAP_TOTAL","swap_used":"$SWAP_USED","disk_total":"$DISK_TOTAL","disk_used":"$DISK_USED","load_avg":"$LOAD_AVG","boot_time":"$BOOT_TIME","net_rx":"$RX_NOW","net_tx":"$TX_NOW","net_rx_monthly":"$RX_MONTHLY","net_tx_monthly":"$TX_MONTHLY","net_in_speed":"$RX_SPEED","net_out_speed":"$TX_SPEED","os":"$EOS","arch":"$EARCH","cpu_info":"$ECPU","cpu_cores":"$CPU_CORES","processes":"$PROCESSES","tcp_conn":"$TCP_CONN","udp_conn":"$UDP_CONN","ip_v4":"$IPV4","ip_v6":"$IPV6","ping_ct":"$PING_CT","ping_cu":"$PING_CU","ping_cm":"$PING_CM","ping_bd":"$PING_BD","loss_ct":"$LOSS_CT","loss_cu":"$LOSS_CU","loss_cm":"$LOSS_CM","loss_bd":"$LOSS_BD"}
 EOF
 )
-    curl -s -o /dev/null -X POST -H "Content-Type: application/json" -d "$PAYLOAD" -m 4 --connect-timeout 2 "$WORKER_URL" 2>/dev/null || true
+    if [ "$COLLECT_INTERVAL" -gt 0 ]; then
+        SAMPLE_TS=$((LOOP_START_TIME * 1000))
+        SAMPLE_JSON="{\"ts\":$SAMPLE_TS,\"metrics\":$METRICS_JSON}"
+        if [ -z "$SAMPLES_JSON" ]; then
+            SAMPLES_JSON="$SAMPLE_JSON"
+        else
+            SAMPLES_JSON="$SAMPLES_JSON,$SAMPLE_JSON"
+        fi
+        SAMPLE_COUNT=$((SAMPLE_COUNT + 1))
+    fi
+
+    if [ "$LAST_REPORT_TIME" -eq 0 ] || [ $((LOOP_START_TIME - LAST_REPORT_TIME)) -ge "$REPORT_INTERVAL" ]; then
+        if [ "$COLLECT_INTERVAL" -gt 0 ]; then
+            PAYLOAD=$(cat <<EOF
+{"id":"$SERVER_ID","secret":"$SECRET","metrics":$METRICS_JSON,"samples":[$SAMPLES_JSON],"collect_interval":$COLLECT_INTERVAL,"report_interval":$REPORT_INTERVAL}
+EOF
+)
+        else
+            PAYLOAD=$(cat <<EOF
+{"id":"$SERVER_ID","secret":"$SECRET","metrics":$METRICS_JSON,"collect_interval":$COLLECT_INTERVAL,"report_interval":$REPORT_INTERVAL}
+EOF
+)
+        fi
+        curl -s -o /dev/null -X POST -H "Content-Type: application/json" -d "$PAYLOAD" -m 4 --connect-timeout 2 "$WORKER_URL" 2>/dev/null || true
+        SAMPLES_JSON=""
+        SAMPLE_COUNT=0
+        LAST_REPORT_TIME=$LOOP_START_TIME
+    fi
 
     LOOP_END_TIME=$(date +%s)
     EXEC_DURATION=$((LOOP_END_TIME - LOOP_START_TIME))
-    SLEEP_TIME=$((REPORT_INTERVAL - EXEC_DURATION))
+    SLEEP_TIME=$((ACTIVE_INTERVAL - EXEC_DURATION))
     [ "${SLEEP_TIME}" -le 0 ] && SLEEP_TIME=1
     sleep "${SLEEP_TIME}"
 done
@@ -983,6 +1036,7 @@ install_probe() {
     SERVER_ID=""
     SECRET=""
     WORKER_URL=""
+    COLLECT_INTERVAL=""
     REPORT_INTERVAL=""
     PING_TYPE=""
     CT_NODE=""
@@ -1010,6 +1064,7 @@ install_probe() {
             -id=*) SERVER_ID="${arg#-id=}" ;;
             -secret=*) SECRET="${arg#-secret=}" ;;
             -url=*) WORKER_URL="${arg#-url=}" ;;
+            -collect_interval=*|-collect=*) COLLECT_INTERVAL="${arg#*=}" ;;
             -interval=*) REPORT_INTERVAL="${arg#-interval=}" ;;
             -ping=*) PING_TYPE="${arg#-ping=}" ;;
             -ct=*) CT_NODE="${arg#-ct=}" ;;
@@ -1036,15 +1091,17 @@ install_probe() {
         step "检测到已有配置文件，执行二次安装..."
         
         if [ -n "${SERVER_ID}" ] && [ -n "${SECRET}" ] && [ -n "${WORKER_URL}" ]; then
+            COLLECT_INTERVAL=${COLLECT_INTERVAL:-0}
             REPORT_INTERVAL=${REPORT_INTERVAL:-60}
             PING_TYPE=${PING_TYPE:-http}
-            RESET_DAY=${RESET_DAY:-1}
+            [ -z "$RESET_DAY" ] && RESET_DAY=1
             
             step "更新配置文件..."
             cat > "${CONFIG_FILE}" << EOF
 SERVER_ID="${SERVER_ID}"
 SECRET="${SECRET}"
 WORKER_URL="${WORKER_URL}"
+COLLECT_INTERVAL="${COLLECT_INTERVAL}"
 REPORT_INTERVAL="${REPORT_INTERVAL}"
 PING_TYPE="${PING_TYPE}"
 CT_NODE="${CT_NODE:-}"
@@ -1061,6 +1118,7 @@ EOF
                     SERVER_ID) SERVER_ID="${value%\"}"; SERVER_ID="${SERVER_ID#\"}" ;;
                     SECRET) SECRET="${value%\"}"; SECRET="${SECRET#\"}" ;;
                     WORKER_URL) WORKER_URL="${value%\"}"; WORKER_URL="${WORKER_URL#\"}" ;;
+                    COLLECT_INTERVAL) COLLECT_INTERVAL="${value%\"}"; COLLECT_INTERVAL="${COLLECT_INTERVAL#\"}" ;;
                     REPORT_INTERVAL) REPORT_INTERVAL="${value%\"}"; REPORT_INTERVAL="${REPORT_INTERVAL#\"}" ;;
                     PING_TYPE) PING_TYPE="${value%\"}"; PING_TYPE="${PING_TYPE#\"}" ;;
                     CT_NODE) CT_NODE="${value%\"}"; CT_NODE="${CT_NODE#\"}" ;;
@@ -1085,16 +1143,17 @@ EOF
                 CU_NODE="${OLD_CU_NODE:-}"
                 CM_NODE="${OLD_CM_NODE:-}"
                 BD_NODE="${OLD_BD_NODE:-}"
-                RESET_DAY="${OLD_RESET_DAY:-1}"
+                [ -z "${OLD_RESET_DAY}" ] && RESET_DAY=1 || RESET_DAY="${OLD_RESET_DAY}"
                 info "已从旧版本服务文件恢复参数"
             else
                 print_usage
             fi
         fi
 
+        COLLECT_INTERVAL=${COLLECT_INTERVAL:-0}
         REPORT_INTERVAL=${REPORT_INTERVAL:-60}
         PING_TYPE=${PING_TYPE:-http}
-        RESET_DAY=${RESET_DAY:-1}
+        [ -z "$RESET_DAY" ] && RESET_DAY=1
 
         step "创建配置目录..."
         mkdir -p "${CONFIG_DIR}" 2>/dev/null || true
@@ -1114,6 +1173,7 @@ EOF
 SERVER_ID="${SERVER_ID}"
 SECRET="${SECRET}"
 WORKER_URL="${WORKER_URL}"
+COLLECT_INTERVAL="${COLLECT_INTERVAL}"
 REPORT_INTERVAL="${REPORT_INTERVAL}"
 PING_TYPE="${PING_TYPE}"
 CT_NODE="${CT_NODE:-}"
@@ -1124,6 +1184,9 @@ RESET_DAY="${RESET_DAY}"
 EOF
         info "配置文件已生成: ${CONFIG_FILE}"
     fi
+
+    COLLECT_INTERVAL=${COLLECT_INTERVAL:-0}
+    REPORT_INTERVAL=${REPORT_INTERVAL:-60}
 
     if [ -n "${RX_CORRECTION}" ] || [ -n "${TX_CORRECTION}" ]; then
         step "应用流量校正..."
@@ -1162,10 +1225,15 @@ EOF
     printf  '    ● Secret      : %s\n' "${SECRET}"
     printf  '    ● Worker URL  : %s\n' "${WORKER_URL}"
     printf  '    ● 上报间隔    : %s秒\n' "${REPORT_INTERVAL}"
+    printf  '    ● 采样间隔    : %s秒\n' "${COLLECT_INTERVAL}"
     printf  '    ● 探测类型    : %s\n' "${PING_TYPE}"
     [ -n "${RX_CORRECTION}" ] && printf  '    ● 下行校正    : %sGB\n' "${RX_CORRECTION}"
     [ -n "${TX_CORRECTION}" ] && printf  '    ● 上行校正    : %sGB\n' "${TX_CORRECTION}"
-    printf  '    ● 流量重置日  : %s号\n' "${RESET_DAY}"
+    if [ "${RESET_DAY}" = "0" ]; then
+        printf  '    ● 流量重置日  : 不重置\n'
+    else
+        printf  '    ● 流量重置日  : %s号\n' "${RESET_DAY}"
+    fi
     [ -n "${CT_NODE}" ] && printf  '    ● CT节点      : %s\n' "${CT_NODE}"
     [ -n "${CU_NODE}" ] && printf  '    ● CU节点      : %s\n' "${CU_NODE}"
     [ -n "${CM_NODE}" ] && printf  '    ● CM节点      : %s\n' "${CM_NODE}"

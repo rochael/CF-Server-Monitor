@@ -64,12 +64,14 @@ jobs:
           [vars]
           API_SECRET = "SECRET_PLACEHOLDER"
           API_USER_NAME = "USER_NAME_PLACEHOLDER"
+          CORS_ALLOWED_ORIGINS = "CORS_ORIGINS_PLACEHOLDER"
           WEOF
 
           # 替换占位符
           sed -i "s|D1_PLACEHOLDER|${{ secrets.D1_DATABASE_ID }}|g" wrangler.toml
           sed -i "s|SECRET_PLACEHOLDER|${{ secrets.API_SECRET }}|g" wrangler.toml
           sed -i "s|USER_NAME_PLACEHOLDER|${{ secrets.API_USER_NAME }}|g" wrangler.toml
+          sed -i "s|CORS_ORIGINS_PLACEHOLDER|${{ secrets.CORS_ALLOWED_ORIGINS }}|g" wrangler.toml
 
           echo "✅ wrangler.toml 已生成"
 

@@ -35,7 +35,7 @@
           @click="setFilter(code)"
         >
           <span v-if="code === 'unknown'" class="filter-tag-icon">🏳️</span>
-          <img v-else-if="code !== 'all'" :src="'https://flagcdn.com/16x12/' + getFlagCountryCode(code) + '.png'" :alt="code">
+          <img v-else-if="code !== 'all'" :src="'https://flagcdn.com/16x12/' + getFlagRegionCode(code) + '.png'" :alt="code">
           {{ code === 'all' ? '[' + trans.all + ']' : code === 'unknown' ? 'UNKNOWN' : code.toUpperCase() }} {{ count }}
         </span>
       </div>
@@ -68,7 +68,7 @@
         <div class="loading-text">$ {{ trans.loading }}</div>
       </div>
       <div v-else-if="groupedServers.length === 0" class="empty-state">
-        [!] {{ trans.noServer }}，请在 <a href="/admin" class="admin-link-color">{{ trans.backToAdmin }}</a> 中添加
+        [!] {{ trans.noServer }}，请在 <router-link to="/admin" class="admin-link-color">{{ trans.backToAdmin }}</router-link> 中添加
       </div>
       <div v-else>
         <div v-for="group in groupedServers" :key="group.name" class="group-section">
@@ -81,6 +81,7 @@
               :key="server.id" 
               :server="server"
               :sys-config="sysConfig"
+              :to="getServerLink(server)"
             />
           </div>
         </div>
@@ -118,20 +119,20 @@
             <tr 
               v-for="server in filteredServers" 
               :key="server.id"
-              @click="goToServer(server.id)"
+              @click="goToServer(server)"
               class="table-cursor-pointer"
-              :data-country="(server.country || 'xx').toLowerCase()"
+              :data-region="(server.region || 'xx').toLowerCase()"
             >
               <td class="table-center-cell">
                 <div class="status-indicator table-status-indicator-inline" :style="{ background: getStatusColor(server) }"></div>
               </td>
               <td><b>{{ server.name }}</b></td>
               <td>
-                <span v-if="server.country && server.country !== 'xx'">
-                  <img :src="'https://flagcdn.com/24x18/' + getFlagCountryCode(server.country) + '.png'" :alt="server.country" class="flag-img">
+                <span v-if="server.region && server.region !== 'xx'">
+                  <img :src="'https://flagcdn.com/24x18/' + getFlagRegionCode(server.region) + '.png'" :alt="server.region" class="flag-img">
                 </span>
                 <span v-else>🏳️</span>
-                {{ (server.country || 'XX').toUpperCase() }}
+                {{ (server.region || 'XX').toUpperCase() }}
               </td>
               <td><span class="os-label">{{ server.os || 'N/A' }} / {{ server.arch || 'N/A' }} </span></td>
               <td>
@@ -145,9 +146,9 @@
               <td>
                 <div class="table-stat">
                   <div class="stat-bar-container" style="width:60px;">
-                    <div class="stat-bar-fill" :style="{ width: (parseFloat(server.ram) || 0) + '%', background: 'var(--accent-purple)' }"></div>
+                    <div class="stat-bar-fill" :style="{ width: (server.ram_total > 0 ? ((server.ram_used / server.ram_total) * 100).toFixed(2) : 0) + '%', background: 'var(--accent-purple)' }"></div>
                   </div>
-                  <span>{{ (parseFloat(server.ram) || 0).toFixed(1) }}%</span>
+                  <span>{{ server.ram_total > 0 ? ((server.ram_used / server.ram_total) * 100).toFixed(2) : '0.00' }}%</span>
                 </div>
               </td>
               <td>
@@ -188,10 +189,11 @@
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { useRouter } from 'vue-router'
 import TerminalHeader from '../components/TerminalHeader.vue'
 import ServerCard from '../components/ServerCard.vue'
 import Footer from '../components/Footer.vue'
-import { fetchServers, formatBytes, createLiveSocket, getFlagCountryCode } from '../utils/api.js'
+import { fetchServers, fetchServersAll, formatBytes, createLiveSocket, getFlagRegionCode, getApiBases } from '../utils/api.js'
 import { t, currentLang } from '../utils/i18n.js'
 import { translations } from '../utils/i18n.js'
 import { TIME } from '../utils/constants'
@@ -204,24 +206,26 @@ const sysConfig = ref({
   show_expire: true,
   show_bw: true,
   show_tf: true,
+  show_time: true,
   site_title: 'Server Monitor'
 })
-const countryStats = ref({})
+const regionStats = ref({})
 const currentView = ref('card')
 const currentFilter = ref('all')
 const mapInitialized = ref(false)
 const liveConnected = ref(false)
 const isLoading = ref(true)
 const now = ref(Date.now())
+const router = useRouter()
 
 const trans = computed(() => translations[currentLang.value] || translations.en)
 
 const filterOptions = computed(() => {
   const normalizedStats = {}
-  for (const code in countryStats.value) {
+  for (const code in regionStats.value) {
     const lower = code.toLowerCase()
     if (lower === 'xx') continue
-    normalizedStats[lower] = countryStats.value[code]
+    normalizedStats[lower] = regionStats.value[code]
   }
   const opts = { all: stats.value.total, ...normalizedStats }
   if (unknownStats.value > 0) opts.unknown = unknownStats.value
@@ -230,8 +234,8 @@ const filterOptions = computed(() => {
 
 const filteredServers = computed(() => {
   if (currentFilter.value === 'all') return servers.value
-  if (currentFilter.value === 'unknown') return servers.value.filter(s => !s.country)
-  return servers.value.filter(s => (s.country || 'xx').toLowerCase() === currentFilter.value)
+  if (currentFilter.value === 'unknown') return servers.value.filter(s => !s.region)
+  return servers.value.filter(s => (s.region || 'xx').toLowerCase() === currentFilter.value)
 })
 
 const groupedServers = computed(() => {
@@ -317,32 +321,198 @@ const getTrafficUsagePercent = (server) => {
   return percent.toFixed(1)
 }
 
-// 用最新数据增量更新单台服务器信息
-// 无论后端 last_updated 是否变化，都用前端收到推送的时间更新 last_updated，
-// 保证实时时间列（"xx:xx:xx ago"）在每次推送时都刷新。
-const mergeServerUpdate = (data) => {
-  if (!data || !data.id) return false
-  const idx = servers.value.findIndex(s => s.id === data.id)
-  if (idx >= 0) {
-    // 已有服务器：合并字段，同时更新 last_updated 为前端收到时间
-    servers.value[idx] = { ...servers.value[idx], ...data, last_updated: Date.now() }
-  } else {
-    // 新服务器：加入列表
-    servers.value.push({ ...data, name: data.id, last_updated: Date.now() })
+const PLAYBACK_TICK_MS = 1000
+const MAX_BUFFER_SAMPLES_PER_SERVER = 600
+const playbackBuffers = new Map()
+
+const normalizeMetricTimestamp = (value, fallback = null) => {
+  const ts = Number(value)
+  if (Number.isFinite(ts) && ts > 0) {
+    return ts < 10000000000 ? ts * 1000 : ts
   }
-  return true
+  const parsed = new Date(value).getTime()
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
 }
 
-const recomputeStats = () => {
+const getServerReportTimestamp = (server, fallback = null) => {
+  return normalizeMetricTimestamp(server?.report_timestamp ?? server?.last_updated, fallback)
+}
+
+const getServerSampleTimestamp = (server) => {
+  return normalizeMetricTimestamp(server?.sample_timestamp ?? server?.timestamp ?? server?.last_updated, null)
+}
+
+const getServerDisplayTimestamp = (server) => {
+  return normalizeMetricTimestamp(server?.display_timestamp, null)
+}
+
+const withDisplayTiming = (server, displayTs = null, currentTs = Date.now()) => {
+  const reportTs = getServerReportTimestamp(server, null)
+  const sampleTs = getServerSampleTimestamp(server) || displayTs || reportTs
+  const ownTs = normalizeMetricTimestamp(displayTs, getServerDisplayTimestamp(server) || sampleTs || reportTs)
+  const timed = {
+    ...server,
+    current_timestamp: currentTs
+  }
+  if (reportTs) {
+    timed.report_timestamp = reportTs
+    timed.last_updated = reportTs
+  }
+  if (!sampleTs || !ownTs) return timed
+  return {
+    ...timed,
+    sample_timestamp: sampleTs,
+    display_timestamp: ownTs,
+    sample_lag_seconds: Math.max(0, Math.floor((ownTs - sampleTs) / 1000))
+  }
+}
+
+const toLiveSample = (serverId, data, timestamp, reportTs) => {
+  if (!serverId || !data) return
+  const ts = normalizeMetricTimestamp(timestamp ?? data.sample_timestamp ?? data.last_updated ?? data.timestamp, null)
+  if (!ts) return null
+  return {
+    serverId,
+    ts,
+    data,
+    reportTs
+  }
+}
+
+const queueLiveSamples = (serverId, samples, reportTs) => {
+  if (!serverId || !Array.isArray(samples) || samples.length === 0) return
+
+  const normalized = samples
+    .map(sample => toLiveSample(serverId, sample.data, sample.ts, reportTs))
+    .filter(Boolean)
+    .sort((a, b) => a.ts - b.ts)
+
+  if (normalized.length === 0) return
+
+  const current = servers.value.find(s => s.id === serverId)
+  const currentTs = getServerSampleTimestamp(current)
+  const incoming = normalized.filter(sample => !currentTs || sample.ts > currentTs)
+  if (incoming.length === 0) return
+
+  if (incoming.length === 1) {
+    playbackBuffers.delete(serverId)
+    const sample = incoming[0]
+    applyServerSample(serverId, sample.data, sample.ts, sample.ts, reportTs)
+    return
+  }
+
+  const firstTs = incoming[0].ts
+  const unique = []
+  const seen = new Set()
+  for (const sample of incoming) {
+    if (seen.has(sample.ts)) continue
+    seen.add(sample.ts)
+    unique.push(sample)
+  }
+  playbackBuffers.set(serverId, unique.slice(-MAX_BUFFER_SAMPLES_PER_SERVER))
+  applyPlaybackSamplesForServer(serverId, firstTs)
+}
+
+const queueLiveMessage = (msg) => {
+  if (!msg || (msg.type !== 'update' && msg.type !== 'batchUpdate')) return
+
+  const reportTs = normalizeMetricTimestamp(msg.ts, Date.now())
+
+  const updates = Array.isArray(msg.updates)
+    ? msg.updates
+    : (msg.serverId ? [{ serverId: msg.serverId, samples: msg.samples, data: msg.data, payload: msg.payload, ts: msg.ts }] : [])
+
+  for (const update of updates) {
+    if (!update || !update.serverId) continue
+    const samples = Array.isArray(update.samples)
+      ? update.samples
+      : (update.payload || update.data
+          ? [{
+              ts: (update.data || update.payload).sample_timestamp || (update.data || update.payload).last_updated || (update.data || update.payload).timestamp || update.ts || msg.ts,
+              data: update.data || update.payload
+            }]
+          : [])
+
+    const liveSamples = []
+    for (const sample of samples) {
+      if (!sample || typeof sample !== 'object') continue
+      const data = sample.data || sample.payload || sample.metrics
+      if (!data) continue
+      liveSamples.push({
+        ts: sample.ts ?? sample.timestamp ?? data.sample_timestamp ?? data.last_updated ?? data.timestamp ?? update.ts ?? msg.ts,
+        data
+      })
+    }
+    queueLiveSamples(update.serverId, liveSamples, reportTs)
+  }
+}
+
+const applyServerSample = (serverId, data, sampleTs, displayTs, reportTs = null) => {
+  if (!serverId || !data) return
+  const idx = servers.value.findIndex(s => s.id === serverId)
+  const existing = idx >= 0 ? servers.value[idx] : null
+  const currentReportTs = getServerReportTimestamp(existing, null)
+  const nextReportTs = normalizeMetricTimestamp(reportTs, currentReportTs || now.value)
+  const merged = withDisplayTiming({
+    ...data,
+    id: serverId,
+    report_timestamp: nextReportTs,
+    last_updated: nextReportTs,
+    sample_timestamp: sampleTs,
+    timestamp: sampleTs
+  }, displayTs, now.value)
+
+  if (idx >= 0) {
+    servers.value[idx] = { ...servers.value[idx], ...merged }
+  } else {
+    servers.value.push({ ...merged, name: serverId })
+  }
+}
+
+const applyPlaybackSamplesForServer = (serverId, displayTs = null) => {
+  const samples = playbackBuffers.get(serverId)
+  if (!samples || samples.length === 0) return
+  const server = servers.value.find(s => s.id === serverId)
+  const ownTs = normalizeMetricTimestamp(displayTs, getServerDisplayTimestamp(server))
+  if (!ownTs) return
+
+  let selected = null
+  while (samples.length > 0 && samples[0].ts <= ownTs) {
+    selected = samples.shift()
+  }
+  if (selected) {
+    applyServerSample(serverId, selected.data, selected.ts, ownTs, selected.reportTs)
+  }
+  if (samples.length === 0) playbackBuffers.delete(serverId)
+}
+
+const applyPlaybackSamples = () => {
+  for (const serverId of Array.from(playbackBuffers.keys())) {
+    applyPlaybackSamplesForServer(serverId)
+  }
+}
+
+const advanceServerClocks = () => {
+  const currentTs = now.value
+  servers.value = servers.value.map(server => {
+    const reportTs = getServerReportTimestamp(server, null)
+    const isOnline = reportTs && (currentTs - reportTs) < TIME.ONLINE_THRESHOLD_MS
+    const currentDisplayTs = getServerDisplayTimestamp(server) || getServerSampleTimestamp(server) || reportTs
+    const nextDisplayTs = isOnline && currentDisplayTs ? currentDisplayTs + PLAYBACK_TICK_MS : currentDisplayTs
+    return withDisplayTiming(server, nextDisplayTs, currentTs)
+  })
+  applyPlaybackSamples()
+}
+
+const recomputeStats = (currentTs = Date.now()) => {
   const list = servers.value || []
-  const now = Date.now()
   let online = 0
   let speedIn = 0, speedOut = 0, netRx = 0, netTx = 0
-  const countryCounts = {}
+  const regionCounts = {}
   let unknownCount = 0
   for (const s of list) {
     const ts = new Date(s.last_updated || 0).getTime()
-    const isOnline = ts && (now - ts) < TIME.ONLINE_THRESHOLD_MS
+    const isOnline = ts && (currentTs - ts) < TIME.ONLINE_THRESHOLD_MS
     if (isOnline) {
       online++
       speedIn += parseFloat(s.net_in_speed) || 0
@@ -350,9 +520,9 @@ const recomputeStats = () => {
     }
     netRx += parseFloat(s.net_rx) || 0
     netTx += parseFloat(s.net_tx) || 0
-    if (s.country) {
-      const key = String(s.country).toUpperCase()
-      countryCounts[key] = (countryCounts[key] || 0) + 1
+    if (s.region) {
+      const key = String(s.region).toUpperCase()
+      regionCounts[key] = (regionCounts[key] || 0) + 1
     } else {
       unknownCount++
     }
@@ -366,49 +536,44 @@ const recomputeStats = () => {
     globalSpeedIn: speedIn,
     globalSpeedOut: speedOut
   }
-  countryStats.value = countryCounts
+  regionStats.value = regionCounts
   unknownStats.value = unknownCount
+}
+
+const runDashboardTick = () => {
+  now.value = Date.now()
+  advanceServerClocks()
+  recomputeStats(now.value)
+  if (currentView.value === 'map') drawMarkers()
 }
 
 const refreshData = async () => {
   try {
-    const data = await fetchServers()
+    const bases = getApiBases()
+    const data = bases.length > 0 ? await fetchServersAll() : await fetchServers()
     if (!data) return
 
     const rawServers = Array.isArray(data.servers)
       ? data.servers
       : Object.entries(data.latestMetricsMap || {}).map(([id, metrics]) => ({ id, ...metrics }))
 
-    // 合并已有列表与最新服务端全量数据（优先使用服务端返回的 name/group 等完整字段）
     const existingById = new Map(servers.value.map(s => [s.id, s]))
     const nextList = rawServers.map(s => {
       const prev = existingById.get(s.id)
-      // 取服务端返回作为权威数据，并保留本地字段以防服务端缺少
-      return { ...prev, ...s }
+      const sampleTs = normalizeMetricTimestamp(s.sample_timestamp ?? s.timestamp ?? s.last_updated, getServerSampleTimestamp(prev))
+      const reportTs = normalizeMetricTimestamp(s.report_timestamp ?? s.last_updated, getServerReportTimestamp(prev, null))
+      return withDisplayTiming({ ...prev, ...s, sample_timestamp: sampleTs, report_timestamp: reportTs }, sampleTs, now.value)
     })
     servers.value = nextList
 
-    if (data.stats) stats.value = data.stats
-    if (data.countryStats) {
-      const cleaned = {}
-      for (const code in data.countryStats) {
-        if (code.toLowerCase() === 'xx') continue
-        cleaned[code] = data.countryStats[code]
-      }
-      countryStats.value = cleaned
-    }
-    // 始终基于当前服务器列表计算未知国家数量（与 recomputeStats 保持一致）
-    let unknownCount = 0
-    for (const s of servers.value) {
-      if (!s.country) unknownCount++
-    }
-    unknownStats.value = unknownCount
+    recomputeStats(now.value)
 
     sysConfig.value = {
       show_price: data.sysConfig?.show_price ?? true,
       show_expire: data.sysConfig?.show_expire ?? true,
       show_bw: data.sysConfig?.show_bw ?? true,
       show_tf: data.sysConfig?.show_tf ?? true,
+      show_time: data.sysConfig?.show_time ?? true,
       site_title: data.sysConfig?.site_title || 'Server Monitor'
     }
 
@@ -425,31 +590,49 @@ const refreshData = async () => {
 //   - 订阅 "all"，收到任何服务器的更新都会合并对应 server 的指标
 //   - WS 连上后关闭 60s 兜底轮询；断开后临时开启作为降级（WS 重连成功后再次清除）
 // -------------------------------------------------------------------------
-let liveSocket = null
+let liveSockets = []
 let refreshInterval = null
 let themeObserver = null
 let timeUpdateInterval = null
 
-const applyLiveUpdate = ({ serverId, data }) => {
-  if (!data || !serverId) return
-  mergeServerUpdate(data)
-  recomputeStats()
-  if (currentView.value === 'map') drawMarkers()
-}
-
 const startLiveSocket = () => {
-  liveSocket = createLiveSocket('all', {
-    onUpdate: applyLiveUpdate,
-    onStatus: ({ connected }) => {
-      liveConnected.value = !!connected
-      if (connected) {
-        // WS 可用，清除定时轮询
-        if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null }
-      } else if (!refreshInterval) {
-        // WS 断开，降级启用 60s 轮询直到重连成功
-        refreshInterval = setInterval(refreshData, 60000)
+  const bases = getApiBases()
+
+  // 如果没有配置多个 API bases，使用原来的单连接方式
+  if (bases.length === 0) {
+    liveSockets = [createLiveSocket('all', {
+      replay: false,
+      onMessage: queueLiveMessage,
+      onStatus: ({ connected }) => {
+        liveConnected.value = !!connected
+        if (connected) {
+          if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null }
+        } else if (!refreshInterval) {
+          refreshInterval = setInterval(refreshData, 60000)
+        }
       }
-    }
+    })]
+    return
+  }
+
+  // 为每个 API base 创建独立的 WebSocket 连接
+  liveSockets = bases.map((_, index) => {
+    return createLiveSocket('all', {
+      replay: false,
+      onMessage: queueLiveMessage,
+      onStatus: ({ connected }) => {
+        // 只要有一个连接成功，就认为实时推送可用
+        const anyConnected = liveSockets.some(s => s && s.isConnected)
+        liveConnected.value = anyConnected
+
+        if (anyConnected) {
+          if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null }
+        } else if (!refreshInterval) {
+          // 所有连接都断开时，启用降级轮询
+          refreshInterval = setInterval(refreshData, 60000)
+        }
+      }
+    }, index)
   })
 }
 
@@ -497,7 +680,7 @@ const createMap = () => {
     .catch(e => console.error('[ERROR] Map load failed', e))
 }
 
-const countryCoords = {
+const regionCoords = {
   'US': [37.09, -95.71], 'CN': [35.86, 104.19], 'JP': [36.20, 138.25], 'HK': [22.31, 114.16],
   'SG': [1.35, 103.81], 'KR': [35.90, 127.76], 'DE': [51.16, 10.45], 'GB': [55.37, -3.43],
   'NL': [52.13, 5.29], 'FR': [46.22, 2.21], 'CA': [56.13, -106.34], 'AU': [-25.27, 133.77],
@@ -526,7 +709,7 @@ const getThemeColors = () => {
 const drawMarkers = () => {
   if (!window.myMap || !window.worldGeoJson) return
 
-  const newDataStr = JSON.stringify(countryStats.value)
+  const newDataStr = JSON.stringify(regionStats.value)
   if (currentMapDataStr === newDataStr) return
   currentMapDataStr = newDataStr
 
@@ -536,7 +719,7 @@ const drawMarkers = () => {
 
   const colors = getThemeColors()
   const activeIso2 = {}
-  for (const code in countryStats.value) {
+  for (const code in regionStats.value) {
     const upperCode = code.toUpperCase()
     activeIso2[upperCode] = true
     if (upperCode === 'HK' || upperCode === 'TW' || upperCode === 'MO') {
@@ -557,21 +740,31 @@ const drawMarkers = () => {
     }
   }).addTo(window.myMap)
 
-  for (const [code, count] of Object.entries(countryStats.value)) {
+  for (const [code, count] of Object.entries(regionStats.value)) {
     const upperCode = code.toUpperCase()
-    if (countryCoords[upperCode]) {
+    if (regionCoords[upperCode]) {
       const icon = window.L.divIcon({
         className: 'custom-map-marker',
         html: `<div style="background:${colors.accentGreen}; color:${colors.colorBlack}; border-radius:50%; width:22px; height:22px; display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:bold; border:2px solid ${colors.bgPrimary}; box-shadow:0 0 10px ${colors.accentGreen}80; font-family:JetBrains Mono,monospace;">${count}</div>`,
         iconSize: [22,22]
       })
-      window.L.marker(countryCoords[upperCode], {icon: icon}).addTo(markersLayer)
+      window.L.marker(regionCoords[upperCode], {icon: icon}).addTo(markersLayer)
     }
   }
 }
 
-const goToServer = (id) => {
-  window.location.href = `/server/${id}`
+const getServerLink = (server) => {
+  const bases = getApiBases()
+  if (bases.length === 0) return `/server/${server.id}`
+  
+  const apiIndex = bases.indexOf(server.source)
+  if (apiIndex === -1 || apiIndex === 0) return `/server/${server.id}`
+  
+  return `/server/${server.id}?apiIndex=${apiIndex}`
+}
+
+const goToServer = (server) => {
+  router.push(getServerLink(server))
 }
 
 onMounted(() => {
@@ -581,9 +774,8 @@ onMounted(() => {
   startLiveSocket()
 
   // 每秒更新 now 变量，使相对时间实时刷新
-  timeUpdateInterval = setInterval(() => {
-    now.value = Date.now()
-  }, 1000)
+  runDashboardTick()
+  timeUpdateInterval = setInterval(runDashboardTick, 1000)
 
   if (savedView === 'map') {
     switchView('map')
@@ -603,7 +795,11 @@ onMounted(() => {
 onUnmounted(() => {
   if (refreshInterval) clearInterval(refreshInterval)
   if (timeUpdateInterval) clearInterval(timeUpdateInterval)
-  if (liveSocket) liveSocket.close()
+  if (liveSockets.length > 0) {
+    liveSockets.forEach(socket => {
+      if (socket) socket.close()
+    })
+  }
   if (themeObserver) themeObserver.disconnect()
 })
 </script>

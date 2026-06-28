@@ -209,7 +209,7 @@ async function bootstrap() {
       }),
       after: c.name === 'GET /api/config' ? async result => {
         const data = result.data && result.data.data ? result.data.data : result.data;
-        state.cookieAuth = data && data.cookie_auth === true;
+        state.cookieAuth = data && data.verified === true;
       } : undefined
     });
   }

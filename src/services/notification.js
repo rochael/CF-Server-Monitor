@@ -1,6 +1,6 @@
 import { getLatestMetricsForAllServers } from '../database/schema.js';
 import { getAllServers } from '../utils/cache.js';
-import { loadSiteSettings, clearSiteSettingsCache, debug } from '../utils/settings.js';
+import { loadSiteSettings, saveSiteOptions, debug } from '../utils/settings.js';
 
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000;
@@ -71,16 +71,7 @@ export async function checkOfflineNodes(db) {
     const newCount = skipCount + 1;
     const finalCount = newCount > 5 ? 0 : newCount;
     
-    const siteOptionsResult = await db.prepare('SELECT value FROM settings WHERE key = ?').bind('site_options').first();
-    const siteOptions = siteOptionsResult && siteOptionsResult.value && siteOptionsResult.value.length > 0 
-      ? JSON.parse(siteOptionsResult.value) 
-      : {};
-    siteOptions.cleanup_skip_count = String(finalCount);
-    await db.prepare(
-      'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
-    ).bind('site_options', JSON.stringify(siteOptions)).run();
-    
-    clearSiteSettingsCache();
+    await saveSiteOptions(db, { cleanup_skip_count: String(finalCount) });
     return;
   }
 

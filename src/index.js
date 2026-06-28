@@ -5,11 +5,12 @@ import { handleAdminAPI } from './handlers/admin.js';
 import { serveFrontend } from './handlers/frontend.js';
 import { handleUpdate, handleWebSocketUpgrade } from './handlers/update.js';
 import { handleServerAPI, handleServersAPI } from './handlers/dashboard.js';
-import { loadSettings, loadSiteSettings, setDebug } from './utils/settings.js';
+import { loadSettings, loadSiteSettings, setDebug, debug, getCurrentVersion } from './utils/settings.js';
 import { checkAuth, simpleAuthResponse } from './middleware/auth.js';
 import { getServerDetail, getMetricsHistoryCache, setMetricsHistoryCache, getCacheDuration } from './utils/cache.js';
 import { AppError, createSuccessResponse, createUnauthorizedResponse, createBadRequestResponse, createNotFoundResponse, createErrorResponse } from './utils/errors.js';
 import { verifyTurnstileToken } from './utils/common.js';
+import { getCorsAllowedOrigins, createOptionsResponse, applyCors } from './utils/cors.js';
 // Durable Objects: 实时指标广播
 // 显式 import + extends，确保 wrangler 静态分析器能在入口文件直接识别此 DO 类
 import { MetricsBroadcaster as _MetricsBroadcaster }
@@ -30,7 +31,7 @@ async function getEncryptionKey(env) {
   return keyMaterial;
 }
 
-async function encryptCookieData(data, env) {
+async function encryptTurnstileData(data, env) {
   const key = await getEncryptionKey(env);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const encoder = new TextEncoder();
@@ -46,7 +47,7 @@ async function encryptCookieData(data, env) {
   return btoa(String.fromCharCode(...combined));
 }
 
-async function decryptCookieData(encoded, env) {
+async function decryptTurnstileData(encoded, env) {
   try {
     const key = await getEncryptionKey(env);
     const decoded = new Uint8Array(atob(encoded).split('').map(c => c.charCodeAt(0)));
@@ -60,20 +61,22 @@ async function decryptCookieData(encoded, env) {
     const encoder = new TextDecoder();
     return JSON.parse(encoder.decode(decrypted));
   } catch (e) {
-    console.error('Cookie decryption error:', e);
+    debug('Cookie decryption error:', e);
     return null;
   }
 }
 
-async function isTurnstileCookieValid(request, env) {
-  const cookies = request.headers.get('Cookie') || '';
-  const turnstileCookie = cookies.split(';').find(c => c.trim().startsWith('turnstile_verified='));
+async function isTurnstileVerified(request, env) {
+  const verifiedHeader = request.headers.get('X-Turnstile-Verified');
   
-  if (!turnstileCookie) return false;
+  if (!verifiedHeader) return false;
   
-  const encryptedData = turnstileCookie.split('=')[1];
-  const decrypted = await decryptCookieData(encryptedData, env);
-  return decrypted && decrypted.expires && Date.now() < decrypted.expires * 1000;
+  try {
+    const decrypted = await decryptTurnstileData(verifiedHeader, env);
+    return decrypted && decrypted.expires && Date.now() < decrypted.expires * 1000;
+  } catch {
+    return false;
+  }
 }
 
 async function fetchHistoryData(env, request, id, hours, columns, sys = null) {
@@ -110,9 +113,9 @@ async function fetchHistoryData(env, request, id, hours, columns, sys = null) {
   } catch (e) {
     const message = e && e.message ? e.message : String(e);
     if (/no such column/i.test(message)) {
-      console.warn('[History] 数据库字段缺失，可能尚未升级数据库:', message);
+      debug('[History] 数据库字段缺失，可能尚未升级数据库:', message);
       return new Response(JSON.stringify({
-        code: 'DATABASE_UPGRADE_REQUIRED'
+        message: 'databaseUpgradeRequired'
       }), {
         status: 409,
         headers: { 'Content-Type': 'application/json' }
@@ -134,15 +137,22 @@ export default {
     const method = request.method;
     const path = url.pathname;
 
+    const corsAllowedOrigins = getCorsAllowedOrigins(env);
+    
     if (!env.API_SECRET || env.API_SECRET.length === 0) {
-      return createBadRequestResponse('API_SECRET is required');
+      const response = createBadRequestResponse('API_SECRET is required');
+      return applyCors(response, request, corsAllowedOrigins);
+    }
+    
+    if (method === 'OPTIONS') {
+      return createOptionsResponse(request, corsAllowedOrigins);
     }
 
     if (env.ASSETS && method === 'GET') {
       try {
         const res = await env.ASSETS.fetch(new Request(`http://static${path}`, request));
         if (res.ok) {
-          return res;
+          return applyCors(res, request, corsAllowedOrigins);
         }
       } catch (e) {
       }
@@ -150,7 +160,7 @@ export default {
 
     const bypassTurnstilePaths = [
       '/admin/api',
-      '/api/config',
+      '/api/ws',
     ];
 
     const isApiRequest = path.startsWith('/api/') || path.startsWith('/admin/api');
@@ -158,26 +168,37 @@ export default {
       await initDatabase(env.DB);
     }
 
-    let setTurnstileCookie = false;
+    // /api/config 在不带 X-Turnstile-Token 且不带 X-Turnstile-Verified 时仍然 bypass（用于初始化判断是否需要验证），
+    // 带 token 或 verified header 时则走完整验证流程，以便复用 verified 字段返回验证结果
+    const isTurnstileBypassed = (reqPath) => {
+      if (bypassTurnstilePaths.includes(reqPath)) return true;
+      if (reqPath === '/api/config' && !request.headers.get('X-Turnstile-Token') && !request.headers.get('X-Turnstile-Verified')) return true;
+      return false;
+    };
+
+    let setTurnstileVerified = false;
     let sys = null;
-    
-    if (isApiRequest && !bypassTurnstilePaths.includes(path)) {
+
+    if (isApiRequest && !isTurnstileBypassed(path)) {
       sys = await loadSiteSettings(env.DB);
       const turnstileEnabled = sys.turnstile_enabled === 'true';
       const turnstileSecretKey = sys.turnstile_secret_key || '';
       
+      // 全局 Turnstile 验证：仅 turnstile_enabled 开启时拦截所有 API 请求
+      // turnstile_login_enabled 仅在登录时验证，不在此处拦截
       if (turnstileEnabled) {
-        const hasValidCookie = await isTurnstileCookieValid(request, env);
+        const hasValidCookie = await isTurnstileVerified(request, env);
         
         if (!hasValidCookie) {
           const turnstileToken = request.headers.get('X-Turnstile-Token');
           const isVerified = await verifyTurnstileToken(turnstileToken, turnstileSecretKey);
           
           if (!isVerified) {
-            return createErrorResponse(new AppError('Turnstile verification failed', 403));
+            const response = createErrorResponse(new AppError('Turnstile verification failed', 403));
+            return applyCors(response, request, corsAllowedOrigins);
           }
           
-          setTurnstileCookie = true;
+          setTurnstileVerified = true;
         }
       }
     }
@@ -204,16 +225,27 @@ export default {
       { method: 'GET', path: '/api/config', handler: async () => {
         await ensureFullSettings();
         const turnstileEnabled = sys.turnstile_enabled === 'true';
-        let cookieAuth = false;
-        
+        const turnstileLoginEnabled = sys.turnstile_login_enabled === 'true';
+        let verified = false;
+        let turnstileVerified = null;
+
         if (turnstileEnabled) {
-          cookieAuth = await isTurnstileCookieValid(request, env);
+          verified = await isTurnstileVerified(request, env);
+          if (setTurnstileVerified) {
+            verified = true;
+            const expires = Math.floor(Date.now() / 1000) + 3600;
+            const cookieData = { expires, verified: true, timestamp: Date.now() };
+            turnstileVerified = await encryptTurnstileData(cookieData, env);
+          }
         }
-        
+
         return createSuccessResponse({
+          version: getCurrentVersion(),
           turnstile_enabled: turnstileEnabled,
+          turnstile_login_enabled: turnstileLoginEnabled,
           turnstile_site_key: sys.turnstile_site_key || '',
-          cookie_auth: cookieAuth,
+          verified: verified,
+          turnstile_verified: turnstileVerified,
           show_long_history: sys.show_long_history === 'true'
         });
       }},
@@ -231,7 +263,8 @@ export default {
         await ensureFullSettings();
         const id = url.searchParams.get('id');
         const hours = parseFloat(url.searchParams.get('hours') || '24');
-        const allColumns = 'cpu, gpu, gpu_info, ram, disk_total, disk_used, processes, net_in_speed, net_out_speed, tcp_conn, udp_conn, ping_ct, ping_cu, ping_cm, ping_bd, loss_ct, loss_cu, loss_cm, loss_bd, swap_total, swap_used, load_avg';
+        const allColumns = 'cpu, gpu, gpu_info, ram_total, ram_used, disk_total, disk_used, processes, net_in_speed, net_out_speed, tcp_conn, udp_conn, ping_ct, ping_cu, ping_cm, ping_bd, loss_ct, loss_cu, loss_cm, loss_bd, swap_total, swap_used, load_avg, region';
+        // 后续版本可以删掉region 字段，用于升级数据库提示
         return fetchHistoryData(env, request, id, hours, allColumns, sys);
       }},
       { method: 'POST', path: '/admin/api', handler: async () => {
@@ -259,73 +292,81 @@ export default {
     for (const route of routes) {
       if (route.method === method && route.path === path) {
         const response = await route.handler();
-        
-        if (setTurnstileCookie && response) {
+
+        // WebSocket 升级响应直接原样返回，不能修改 response 对象
+        if (response.status === 101) {
+          return response;
+        }
+
+        if (setTurnstileVerified) {
           const expires = Math.floor(Date.now() / 1000) + 3600;
           const cookieData = { expires, verified: true, timestamp: Date.now() };
-          const encryptedCookie = await encryptCookieData(cookieData, env);
-          
-          const newHeaders = new Headers(response.headers);
-          newHeaders.set('Set-Cookie', `turnstile_verified=${encryptedCookie}; path=/; max-age=3600; SameSite=Lax; HttpOnly`);
-          
-          const newResponse = new Response(response.body, {
+          const encryptedData = await encryptTurnstileData(cookieData, env);
+
+          const finalHeaders = new Headers(response.headers);
+          finalHeaders.set('Access-Control-Allow-Origin', request.headers.get('Origin') || '');
+          finalHeaders.set('Access-Control-Allow-Credentials', 'true');
+          finalHeaders.set('Vary', 'Origin');
+
+          return new Response(response.body, {
             status: response.status,
-            headers: newHeaders
+            statusText: response.statusText,
+            headers: finalHeaders
           });
-          return newResponse;
         }
-        
-        return response;
+
+        return applyCors(response, request, corsAllowedOrigins);
       }
     }
 
     await ensureFullSettings();
-    return serveFrontend(request, env, sys);
+    const frontendResponse = await serveFrontend(request, env, sys);
+    return applyCors(frontendResponse, request, corsAllowedOrigins);
   },
 
   async scheduled(event, env, ctx) {
     const cron = event.cron;
-    console.debug(`[Cron] 定时任务触发: ${cron}`);
+    debug(`[Cron] 定时任务触发: ${cron}`);
     
     if (cron === '*/1 * * * *') {
-      console.debug('[Cron] 开始执行离线节点检测');
+      debug('[Cron] 开始执行离线节点检测');
       await checkOfflineNodes(env.DB);
-      console.debug('[Cron] 离线节点检测完成');
+      debug('[Cron] 离线节点检测完成');
     } else if (cron === '0 * * * *') {
       const now = new Date();
       const day = now.getUTCDate();
       const hour = now.getUTCHours();
       
       if (day === 1 && hour === 0) {
-        console.debug('[Cron] 开始执行每月数据清理任务（表轮换）');
+        debug('[Cron] 开始执行每月数据清理任务（表轮换）');
         await monthlyCleanup(env.DB);
-        console.debug('[Cron] 每月数据清理任务完成');
+        debug('[Cron] 每月数据清理任务完成');
       }
       
       if (day === 8 && hour === 0) {
-        console.debug('[Cron] 开始执行每月8号清理旧表任务');
+        debug('[Cron] 开始执行每月8号清理旧表任务');
         await dropMetricsHistoryOld(env.DB);
-        console.debug('[Cron] 每月8号清理旧表任务完成');
+        debug('[Cron] 每月8号清理旧表任务完成');
       }
       
       if (hour === 12) {
-        console.debug('[Cron] 开始执行服务器到期检测');
+        debug('[Cron] 开始执行服务器到期检测');
         await checkExpiringServers(env.DB);
-        console.debug('[Cron] 服务器到期检测完成');
+        debug('[Cron] 服务器到期检测完成');
       }
     }else if(env.DEBUG == 1){
       if (cron === '* * 1 * *') {
-        console.debug('[Cron DEBUG] 开始执行每月数据清理任务（表轮换）');
+        debug('[Cron DEBUG] 开始执行每月数据清理任务（表轮换）');
         await monthlyCleanup(env.DB);
-        console.debug('[Cron DEBUG] 每月数据清理任务完成');
+        debug('[Cron DEBUG] 每月数据清理任务完成');
       } else if (cron === '* * 8 * *') {
-        console.debug('[Cron DEBUG] 开始执行每月8号清理旧表任务');
+        debug('[Cron DEBUG] 开始执行每月8号清理旧表任务');
         await dropMetricsHistoryOld(env.DB);
-        console.debug('[Cron DEBUG] 每月8号清理旧表任务完成');
+        debug('[Cron DEBUG] 每月8号清理旧表任务完成');
       } else if (cron === '0 12 * * *') {
-        console.debug('[Cron DEBUG] 开始执行服务器到期检测');
+        debug('[Cron DEBUG] 开始执行服务器到期检测');
         await checkExpiringServers(env.DB);
-        console.debug('[Cron DEBUG] 服务器到期检测完成');
+        debug('[Cron DEBUG] 服务器到期检测完成');
       }
     }
   }

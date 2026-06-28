@@ -8,76 +8,40 @@
 // - 后端 /update 处理器在成功写入 DB 后，调用 /__do_push/<id>
 //   由本 DO 向所有订阅者广播刚收到的指标。
 //
-// - 心跳：每 25s 向客户端发送 ping，避免中间代理断连。
+// - 使用 DO WebSocket Hibernation API，闲置时休眠以节省资源。
+//   通过 setWebSocketAutoResponse 自动响应 ping，无需唤醒 DO。
+
+function parseAllowedOrigins(corsAllowedOrigins) {
+  if (!corsAllowedOrigins || corsAllowedOrigins.trim() === '') {
+    return [];
+  }
+  return corsAllowedOrigins
+    .split(',')
+    .map(o => o.trim())
+    .filter(o => o !== '');
+}
 
 export class MetricsBroadcaster {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    // 存储所有活跃 WebSocket：{ id: { ws, scope, createdAt } }
-    this.sessions = new Map();
-    this.nextSessionId = 0;
 
-    // 心跳定时器
-    this.heartbeatTimer = null;
-    this._ensureHeartbeat();
-
-    // 可选：某些运行时在 state 上暴露 blockConcurrencyWhile
-    // 用于在实例首次启动时串行完成必要初始化，例如从持久化存储回放最新状态
-    if (this.state && typeof this.state.blockConcurrencyWhile === 'function') {
-      this.state.blockConcurrencyWhile(async () => {
-        // 预留：未来可在这里做持久化的最新状态回放
-      });
-    }
+    // 自动响应 ping 心跳，DO 无需被唤醒
+    // @ts-ignore - Cloudflare Workers 运行时提供 WebSocketRequestResponsePair
+    this.state.setWebSocketAutoResponse(
+      // @ts-ignore
+      new WebSocketRequestResponsePair(
+        JSON.stringify({ type: 'ping' }),
+        JSON.stringify({ type: 'pong' })
+      )
+    );
   }
 
-  _ensureHeartbeat() {
-    if (this.heartbeatTimer) return;
-    // Workers 内的 setTimeout 最长 ~30s 可用；heartbeat 25s 比较稳
-    this.heartbeatTimer = setTimeout(() => {
-      this.heartbeatTimer = null;
-      if (this.sessions.size === 0) return;
-      for (const { ws } of this.sessions.values()) {
-        try {
-          if (ws.readyState === 1) {
-            ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
-          }
-        } catch (_) { /* ignore */ }
-      }
-      this._ensureHeartbeat();
-    }, 25000);
-  }
-
-  // 根据 scope 判断会话是否需要接收某台服务器的更新
+  // 根据 scope 判断是否需要接收某台服务器的更新
   _shouldDeliver(sessionScope, serverId) {
     if (!sessionScope) return false;
     if (sessionScope === 'all') return true;
     return sessionScope === serverId;
-  }
-
-  _broadcast(serverId, payload) {
-    if (this.sessions.size === 0) return;
-    const message = JSON.stringify({
-      type: 'update',
-      serverId,
-      ts: Date.now(),
-      data: payload
-    });
-
-    for (const [sid, session] of this.sessions) {
-      const { ws, scope } = session;
-      if (ws.readyState !== 1) {
-        this.sessions.delete(sid);
-        continue;
-      }
-      if (!this._shouldDeliver(scope, serverId)) continue;
-      try {
-        ws.send(message);
-      } catch (e) {
-        try { ws.close(); } catch (_) {}
-        this.sessions.delete(sid);
-      }
-    }
   }
 
   async fetch(request) {
@@ -85,56 +49,52 @@ export class MetricsBroadcaster {
     const path = url.pathname;
     const method = request.method;
 
-    // 1) WebSocket 接入
+    // ── 1) WebSocket 接入 ──────────────────────────────
     if (path === '/ws' || path.endsWith('/ws')) {
       const upgradeHeader = request.headers.get('Upgrade');
       if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
         return new Response('Expected WebSocket upgrade request', { status: 426 });
       }
-      const scope = (url.searchParams.get('subscribe') || 'all').toLowerCase();
+
+      const origin = request.headers.get('Origin');
+      // const allowedOrigins = parseAllowedOrigins(this.env.CORS_ALLOWED_ORIGINS);
+
+      const raw = url.searchParams.get('subscribe') || 'all';
+      const scope = raw.trim().toLowerCase();
 
       // @ts-ignore - Cloudflare Workers 运行时提供 WebSocketPair
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
-      server.accept();
 
-      const sid = ++this.nextSessionId;
-      this.sessions.set(sid, { ws: server, scope, createdAt: Date.now() });
+      // 使用 DO WebSocket Hibernation API 接管连接
+      this.state.acceptWebSocket(server);
 
-      const cleanup = () => {
-        this.sessions.delete(sid);
-        try { server.close(); } catch (_) {}
-      };
+      // 将订阅 scope 附加到 WebSocket（休眠后仍保留）
+      server.serializeAttachment({ scope });
 
-      server.addEventListener('close', cleanup);
-      server.addEventListener('error', cleanup);
-      server.addEventListener('message', (event) => {
-        // 简单处理客户端的 ping
-        try {
-          const msg = JSON.parse(event.data || '{}');
-          if (msg && msg.type === 'pong') return;
-          if (msg && msg.type === 'ping') {
-            if (server.readyState === 1) {
-              server.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
-            }
-          }
-        } catch (_) {}
-      });
-
-      // 立即发送一条 "hello" 让客户端确认连接成功
+      // 立即发送 hello 让客户端确认连接成功
       try {
         server.send(JSON.stringify({
           type: 'hello',
           ts: Date.now(),
           subscribed: scope
         }));
-      } catch (_) {}
+      } catch (_) {
+      }
 
-      return new Response(null, { status: 101, webSocket: client });
+      const responseHeaders = new Headers();
+      responseHeaders.set('Access-Control-Allow-Origin', origin || '*');
+      responseHeaders.set('Access-Control-Allow-Credentials', 'true');
+
+      return new Response(null, {
+        status: 101,
+        webSocket: client,
+        headers: responseHeaders
+      });
     }
 
-    // 2) 内部广播入口：/update 成功后由 Worker 内部转发
-    //    path: /push/<serverId>   body: { metrics } JSON
+    // ── 2) 广播入口：/update 成功后由 Worker 内部转发 ──
+    //     path: /push/<serverId>   body: { metrics } JSON
     if (method === 'POST' && (path.startsWith('/push/') || path.includes('/push/'))) {
       const parts = path.split('/push/');
       const serverId = decodeURIComponent((parts[1] || '').split('/')[0] || '');
@@ -156,20 +116,154 @@ export class MetricsBroadcaster {
       }
 
       this._broadcast(serverId, payload);
-      return new Response(JSON.stringify({ ok: true, subscribers: this.sessions.size }), {
+      const count = this.state.getWebSockets().length;
+      return new Response(JSON.stringify({ ok: true, subscribers: count }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
-    // 3) 健康检查
+    // ── 2b) 批量推送入口 ──────────────────────────────
+    //     body: { updates: [{ serverId, payload }, ...] }
+    if (method === 'POST' && path === '/batch-push') {
+      let body = null;
+      try {
+        body = await request.json();
+      } catch (_) {
+        return new Response(JSON.stringify({ error: 'invalid JSON' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+
+      const updates = body && body.updates;
+      if (!Array.isArray(updates) || updates.length === 0) {
+        return new Response(JSON.stringify({ error: 'missing or empty updates array' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+
+      const normalizedUpdates = this._normalizeBatchUpdates(updates);
+      if (normalizedUpdates.length === 0) {
+        return new Response(JSON.stringify({ error: 'missing valid updates' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+
+      this._broadcastBatch(normalizedUpdates);
+
+      const count = this.state.getWebSockets().length;
+      return new Response(JSON.stringify({ ok: true, count: normalizedUpdates.length, subscribers: count }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // ── 3) 健康检查 ────────────────────────────────────
     if (method === 'GET' && (path === '/health' || path.endsWith('/health'))) {
-      return new Response(JSON.stringify({ ok: true, subscribers: this.sessions.size }), {
+      const count = this.state.getWebSockets().length;
+      return new Response(JSON.stringify({ ok: true, subscribers: count }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
     return new Response('Not found', { status: 404 });
   }
+
+  // 向所有匹配 scope 的 WebSocket 广播推送
+  _broadcast(serverId, payload) {
+    const message = JSON.stringify({
+      type: 'update',
+      serverId,
+      ts: Date.now(),
+      data: payload
+    });
+
+    const websockets = this.state.getWebSockets();
+    for (const ws of websockets) {
+      const attachment = ws.deserializeAttachment();
+      if (!attachment || !this._shouldDeliver(attachment.scope, serverId)) {
+        continue;
+      }
+      try {
+        ws.send(message);
+      } catch (_) {
+        // WebSocket 已异常关闭，DO 会自动清理
+      }
+    }
+  }
+
+  // WebSocket 收到消息（ping 已被自动响应拦截，不会到达此处）
+  _normalizeBatchUpdates(updates) {
+    const now = Date.now();
+    return updates.map(item => {
+      if (!item || !item.serverId) return null;
+      const serverId = String(item.serverId);
+      const rawSamples = Array.isArray(item.samples)
+        ? item.samples
+        : (item.payload ? [{ ts: now, payload: item.payload }] : []);
+
+      const samples = rawSamples.map(sample => {
+        if (!sample || typeof sample !== 'object') return null;
+        const data = sample.data || sample.payload || sample.metrics;
+        if (!data || typeof data !== 'object') return null;
+        const ts = Number(sample.ts || sample.timestamp || data.last_updated || now) || now;
+        return { ts, data };
+      }).filter(Boolean);
+
+      if (samples.length === 0) return null;
+      samples.sort((a, b) => a.ts - b.ts);
+      return { serverId, samples };
+    }).filter(Boolean);
+  }
+
+  _broadcastBatch(updates) {
+    const ts = Date.now();
+    const websockets = this.state.getWebSockets();
+
+    for (const ws of websockets) {
+      const attachment = ws.deserializeAttachment();
+      if (!attachment) continue;
+
+      const scopedUpdates = updates.filter(item => this._shouldDeliver(attachment.scope, item.serverId));
+      if (scopedUpdates.length === 0) continue;
+
+      const only = scopedUpdates.length === 1 ? scopedUpdates[0] : null;
+      const singleSample = only && only.samples.length === 1 ? only.samples[0] : null;
+      const message = singleSample
+        ? JSON.stringify({
+            type: 'update',
+            serverId: only.serverId,
+            ts,
+            data: singleSample.data
+          })
+        : JSON.stringify({
+            type: 'batchUpdate',
+            ts,
+            updates: scopedUpdates
+          });
+
+      try {
+        ws.send(message);
+      } catch (_) {
+        // WebSocket 宸插紓甯稿叧闂紝DO 浼氳嚜鍔ㄦ竻鐞?
+      }
+    }
+  }
+
+  webSocketMessage(ws, message) {
+    // 保留处理扩展消息的入口
+    try {
+      const msg = JSON.parse(message || '{}');
+      if (msg && msg.type === 'pong') return;
+    } catch (_) {}
+  }
+
+  // WebSocket 关闭 — DO 自动清理，无需手动移除
+  webSocketClose(ws, code, reason) {}
+
+  // WebSocket 错误 — DO 自动处理
+  webSocketError(ws, error) {}
 }
 
 export default MetricsBroadcaster;
